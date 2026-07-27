@@ -1,0 +1,13 @@
+# Installable release packages
+
+These are the original PyMOL plugin ZIP files. Install them directly without extracting.
+
+| Version | Package | SHA-256 |
+|---|---|---|
+| 0.1.0 | [KYPyMol-0.1.0.zip](KYPyMol-0.1.0.zip) | `4B7F92899FBC993A6E4EA1B8A954824D4FA4DF1A85690A3B9C5C03CD38DCA512` |
+| 0.1.1 | [KYPyMol-0.1.1.zip](KYPyMol-0.1.1.zip) | `80EABE2A46EE5AB4BC93EEA193A8B0E330CBCC5F43ECF1C32177D571EC240B27` |
+| 0.2.0 | [KYMol-0.2.0.zip](KYMol-0.2.0.zip) | `8B8D4118C654E12C749EEAFD8C44ECF42412501D3B1F85713C4FCED27A616CA4` |
+| 0.3.0 | [KYMol-0.3.0.zip](KYMol-0.3.0.zip) | `C17FFCC34AAF0128DF74D35D7CB20562E788696667891B1B0E9232B83F2C18B3` |
+
+Author: RuoyuLiu  
+License: MIT

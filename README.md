@@ -21,7 +21,7 @@ KYMol is an open-source PyMOL plugin for reviewing many molecular structures wit
 
 ## Installation
 
-1. Download `KYMol-0.3.0.zip` from [Releases](../../releases/latest).
+1. Download [`KYMol-0.3.0.zip`](dist/KYMol-0.3.0.zip) or open [Releases](../../releases/latest).
 2. In PyMOL, open **Plugin > Plugin Manager > Install New Plugin**.
 3. Select the ZIP file without extracting it.
 4. Restart PyMOL.
