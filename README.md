@@ -1,4 +1,4 @@
-# KYPyMol 0.1.0
+# KYPyMol 0.1.1
 
 KYPyMol is a PyMOL plugin that introduces an active-object workflow inspired by Blender.
 
@@ -15,7 +15,10 @@ Author: RuoyuLiu
 
 ## Installation
 
-Install `KYPyMol-0.1.0.zip` from **Plugin > Plugin Manager > Install New Plugin**, then open the panel from the **Plugin** menu.
+Install `KYPyMol-0.1.1.zip` from **Plugin > Plugin Manager > Install New Plugin**, then open the panel from the **Plugin** menu.
+
+This patch fixes Qt button signal handling on PyMOL builds that pass a boolean
+argument when a panel button is clicked.
 
 ## License
 

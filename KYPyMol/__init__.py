@@ -7,7 +7,7 @@ created after using it opens normally without KYPyMol installed.
 
 from .core import KYPyMolController
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 _controller = None
 _dialog = None
