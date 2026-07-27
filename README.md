@@ -1,24 +1,31 @@
-# KYPyMol 0.1.1
+# KYMol 0.2.0
 
-KYPyMol is a PyMOL plugin that introduces an active-object workflow inspired by Blender.
+KYMol is a PyMOL structure-review plugin with a Blender-style active-object workflow.
 
 Author: RuoyuLiu
 
-## Features
+## Highlights
 
-- Panel-managed multi-object selection
-- Gold-highlighted active target
-- Batch alignment to the active target
-- Automatic chain coloring
-- PDB/mmCIF export
-- Selected or whole-chain FASTA copy
+- All selection and object actions are available inside the KYMol panel.
+- The last selected row is the gold active target.
+- `Shift+Alt+A` aligns the other selected objects to the active target.
+- `Alt+C` uses PyMOL's original `util.cbc` chain-color sequence.
+- `H` hides selected objects, `Alt+H` shows hidden objects, and `/` isolates selected objects.
+- `X` or `Delete` removes selected objects after confirmation.
+- `F2` renames the active object.
+- Export the active object or selection to PDB/mmCIF.
+- Copy the selected or whole-chain sequence as FASTA.
+- The panel is resizable and can be minimized.
 
 ## Installation
 
-Install `KYPyMol-0.1.1.zip` from **Plugin > Plugin Manager > Install New Plugin**, then open the panel from the **Plugin** menu.
+Install `KYMol-0.2.0.zip` from **Plugin > Plugin Manager > Install New Plugin**.
+Then open **Plugin > KYMol: Structure Review Panel**.
 
-This patch fixes Qt button signal handling on PyMOL builds that pass a boolean
-argument when a panel button is clicked.
+## Compatibility
+
+KYMol creates standard PyMOL objects, selections, colors, groups, and PSE sessions.
+Recipients do not need KYMol installed to open a saved PSE project.
 
 ## License
 

@@ -1,4 +1,4 @@
-"""PyQt UI.  All domain operations remain in :mod:`KYPyMol.core`."""
+"""PyQt UI. All domain operations remain in :mod:`KYMol.core`."""
 
 from __future__ import annotations
 
@@ -6,7 +6,11 @@ import os
 
 from pymol.Qt import QtCore, QtGui, QtWidgets
 
-from .core import KYPyMolError
+from .core import KYMolError
+
+
+ACTIVE_GOLD = QtGui.QColor("#c99b12")
+ACTIVE_TEXT = QtGui.QColor("#1d1d1d")
 
 
 class ActiveObjectDelegate(QtWidgets.QStyledItemDelegate):
@@ -15,17 +19,20 @@ class ActiveObjectDelegate(QtWidgets.QStyledItemDelegate):
     def paint(self, painter, option, index):
         if index.data(QtCore.Qt.UserRole + 1):
             option = QtWidgets.QStyleOptionViewItem(option)
-            option.palette.setColor(QtGui.QPalette.Highlight, QtGui.QColor("#c99b12"))
-            option.palette.setColor(QtGui.QPalette.HighlightedText, QtGui.QColor("#1d1d1d"))
+            option.backgroundBrush = QtGui.QBrush(ACTIVE_GOLD)
+            option.palette.setColor(QtGui.QPalette.Base, ACTIVE_GOLD)
+            option.palette.setColor(QtGui.QPalette.Highlight, ACTIVE_GOLD)
+            option.palette.setColor(QtGui.QPalette.Text, ACTIVE_TEXT)
+            option.palette.setColor(QtGui.QPalette.HighlightedText, ACTIVE_TEXT)
         super().paint(painter, option, index)
 
 
-class KYPyMolDialog(QtWidgets.QDialog):
+class KYMolDialog(QtWidgets.QDialog):
     def __init__(self, controller, parent=None):
         super().__init__(parent)
         self.controller = controller
-        self.setWindowTitle("KYPyMol — Active Object Review")
-        self.setMinimumSize(570, 440)
+        self.setWindowTitle("KYMol — Structure Review")
+        self.setMinimumSize(820, 620)
         self._build_ui()
         self._install_shortcuts()
         self.refresh_objects()
@@ -33,8 +40,8 @@ class KYPyMolDialog(QtWidgets.QDialog):
     def _build_ui(self):
         layout = QtWidgets.QVBoxLayout(self)
         intro = QtWidgets.QLabel(
-            "Multi-select objects; the last clicked item is the <b>gold active target</b>. "
-            "Sync reads PyMOL <code>sele</code>, then choose its target here."
+            "Select objects here with Ctrl/Shift. The last clicked selected row is the "
+            "<b>gold active target</b>; all structure operations below use this panel state."
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
@@ -48,7 +55,7 @@ class KYPyMolDialog(QtWidgets.QDialog):
 
         line = QtWidgets.QHBoxLayout()
         self.refresh_button = QtWidgets.QPushButton("Refresh objects")
-        self.sync_button = QtWidgets.QPushButton("Sync PyMOL selection")
+        self.sync_button = QtWidgets.QPushButton("Import PyMOL selection (optional)")
         self.refresh_button.clicked.connect(lambda: self.refresh_objects(keep_selection=True))
         self.sync_button.clicked.connect(self.sync_from_pymol)
         line.addWidget(self.refresh_button)
@@ -65,7 +72,7 @@ class KYPyMolDialog(QtWidgets.QDialog):
         self.method_combo = QtWidgets.QComboBox()
         self.method_combo.addItems(["super", "align", "cealign"])
         self.scope_combo = QtWidgets.QComboBox()
-        self.scope_combo.addItem("Auto: current selection → common chain → whole object", "auto")
+        self.scope_combo.addItem("Auto: common chain, then whole object", "auto")
         self.scope_combo.addItem("Current PyMOL selection only", "selection")
         self.scope_combo.addItem("Common chain only", "common_chain")
         self.scope_combo.addItem("Whole object (protein CA)", "whole_object")
@@ -81,13 +88,35 @@ class KYPyMolDialog(QtWidgets.QDialog):
         align_line.addWidget(self.color_button)
         layout.addLayout(align_line)
 
+        display_line = QtWidgets.QHBoxLayout()
+        self.show_button = QtWidgets.QPushButton("Show selected")
+        self.hide_button = QtWidgets.QPushButton("Hide selected")
+        self.only_button = QtWidgets.QPushButton("Only selected")
+        self.focus_button = QtWidgets.QPushButton("Focus active")
+        self.delete_button = QtWidgets.QPushButton("Delete selected (X / Del)")
+        self.delete_button.setStyleSheet(
+            "QPushButton { color: #ffdddd; background: #7f1d1d; padding: 4px 8px; }"
+        )
+        self.show_button.clicked.connect(lambda: self.display_selected("show"))
+        self.hide_button.clicked.connect(lambda: self.display_selected("hide"))
+        self.only_button.clicked.connect(lambda: self.display_selected("only"))
+        self.focus_button.clicked.connect(self.focus_active)
+        self.delete_button.clicked.connect(self.delete_selected)
+        display_line.addWidget(self.show_button)
+        display_line.addWidget(self.hide_button)
+        display_line.addWidget(self.only_button)
+        display_line.addWidget(self.focus_button)
+        display_line.addStretch(1)
+        display_line.addWidget(self.delete_button)
+        layout.addLayout(display_line)
+
         export_line = QtWidgets.QHBoxLayout()
         self.export_mode = QtWidgets.QComboBox()
-        self.export_mode.addItem("Current selection (or active object if empty)", False)
-        self.export_mode.addItem("Entire active object / selected chain", True)
+        self.export_mode.addItem("Active object / chain field", True)
+        self.export_mode.addItem("PyMOL atom selection within active (optional)", False)
         self.export_pdb = QtWidgets.QPushButton("Export PDB")
         self.export_cif = QtWidgets.QPushButton("Export CIF")
-        self.copy_fasta_button = QtWidgets.QPushButton("Copy FASTA")
+        self.copy_fasta_button = QtWidgets.QPushButton("Show / Copy FASTA")
         self.export_pdb.clicked.connect(lambda: self.export("pdb"))
         self.export_cif.clicked.connect(lambda: self.export("cif"))
         self.copy_fasta_button.clicked.connect(self.copy_fasta)
@@ -97,7 +126,15 @@ class KYPyMolDialog(QtWidgets.QDialog):
         export_line.addWidget(self.copy_fasta_button)
         layout.addLayout(export_line)
 
-        self.status = QtWidgets.QLabel("KYPyMol is ready.")
+        self.sequence_preview = QtWidgets.QPlainTextEdit()
+        self.sequence_preview.setReadOnly(True)
+        self.sequence_preview.setPlaceholderText(
+            "The active object's FASTA sequence will appear here and be copied to the clipboard."
+        )
+        self.sequence_preview.setMaximumHeight(110)
+        layout.addWidget(self.sequence_preview)
+
+        self.status = QtWidgets.QLabel("KYMol is ready.")
         self.status.setWordWrap(True)
         self.status.setStyleSheet("QLabel { padding: 7px; background: #20242a; color: #e8edf2; border-radius: 3px; }")
         layout.addWidget(self.status)
@@ -111,6 +148,12 @@ class KYPyMolDialog(QtWidgets.QDialog):
         self.color_shortcut = QtWidgets.QShortcut(QtGui.QKeySequence("Alt+C"), self)
         self.color_shortcut.setContext(QtCore.Qt.ApplicationShortcut)
         self.color_shortcut.activated.connect(self.color_chains)
+        self.delete_x_shortcut = QtWidgets.QShortcut(QtGui.QKeySequence("X"), self.object_list)
+        self.delete_x_shortcut.setContext(QtCore.Qt.WidgetWithChildrenShortcut)
+        self.delete_x_shortcut.activated.connect(self.delete_selected)
+        self.delete_key_shortcut = QtWidgets.QShortcut(QtGui.QKeySequence("Delete"), self.object_list)
+        self.delete_key_shortcut.setContext(QtCore.Qt.WidgetWithChildrenShortcut)
+        self.delete_key_shortcut.activated.connect(self.delete_selected)
 
     def _selected_names(self):
         return [item.data(QtCore.Qt.UserRole) for item in self.object_list.selectedItems()]
@@ -125,6 +168,8 @@ class KYPyMolDialog(QtWidgets.QDialog):
             item = self.object_list.item(row)
             is_active = item.data(QtCore.Qt.UserRole) == active
             item.setData(QtCore.Qt.UserRole + 1, is_active)
+            item.setBackground(QtGui.QBrush(ACTIVE_GOLD) if is_active else QtGui.QBrush())
+            item.setForeground(QtGui.QBrush(ACTIVE_TEXT) if is_active else QtGui.QBrush())
         self.object_list.viewport().update()
 
     def _set_status(self, message, error=False):
@@ -137,7 +182,7 @@ class KYPyMolDialog(QtWidgets.QDialog):
             value = operation()
             self._set_status(self.controller.status_text())
             return value
-        except KYPyMolError as exc:
+        except KYMolError as exc:
             self._set_status(str(exc), error=True)
         except Exception as exc:
             self._set_status("Unexpected error: {}".format(exc), error=True)
@@ -190,6 +235,38 @@ class KYPyMolDialog(QtWidgets.QDialog):
     def color_chains(self):
         self._run(self.controller.color_selected_by_chain)
 
+    def display_selected(self, mode):
+        self._run(lambda: self.controller.display_selected(mode))
+
+    def focus_active(self):
+        self._run(self.controller.focus_active)
+
+    def delete_selected(self):
+        names = list(self.controller.state.selected)
+        if not names:
+            self._set_status("Select at least one object before deleting.", error=True)
+            return
+        preview = "\n".join(names[:8])
+        if len(names) > 8:
+            preview += "\n... and {} more".format(len(names) - 8)
+        answer = QtWidgets.QMessageBox.question(
+            self,
+            "Delete selected objects?",
+            "Delete {} object(s) from the current PyMOL session?\n\n{}\n\n"
+            "Reload the original files to recover them.".format(len(names), preview),
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No,
+        )
+        if answer != QtWidgets.QMessageBox.Yes:
+            return
+
+        def action():
+            deleted = self.controller.delete_selected()
+            self.refresh_objects()
+            return deleted
+
+        self._run(action)
+
     def _export_selection(self):
         return bool(self.export_mode.currentData()), self.chain_edit.text().strip()
 
@@ -210,6 +287,7 @@ class KYPyMolDialog(QtWidgets.QDialog):
         whole_chain, chain = self._export_selection()
         def action():
             fasta = self.controller.fasta_active(whole_chain, chain)
+            self.sequence_preview.setPlainText(fasta)
             QtWidgets.QApplication.clipboard().setText(fasta)
             self._set_status("Copied FASTA to clipboard. " + self.controller.status_text())
         self._run(action)

@@ -1,13 +1,13 @@
-"""KYPyMol: an active-object workflow for PyMOL 2.x.
+"""KYMol: an active-object workflow for PyMOL 2.x.
 
 Install this directory as a zipped PyMOL plugin.  The module deliberately
 creates only normal PyMOL selections/objects and uses cmd.save(), so a PSE
-created after using it opens normally without KYPyMol installed.
+created after using it opens normally without KYMol installed.
 """
 
-from .core import KYPyMolController
+from .core import KYMolController
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 
 _controller = None
 _dialog = None
@@ -18,7 +18,7 @@ def controller():
     global _controller
     if _controller is None:
         from pymol import cmd
-        _controller = KYPyMolController(cmd)
+        _controller = KYMolController(cmd)
     return _controller
 
 
@@ -28,21 +28,21 @@ def ky_sync_selection():
 
 
 def ky_align_selected(method="super", scope="auto", chain=""):
-    """Align selected KYPyMol objects to the active KYPyMol object."""
+    """Align selected KYMol objects to the active KYMol object."""
     return controller().align_selected(method=method, scope=scope, chain=chain)
 
 
 def ky_color_selected():
-    """Color chains in the selected KYPyMol objects."""
+    """Color chains in the selected KYMol objects."""
     return controller().color_selected_by_chain()
 
 
 def open_panel():
-    """Open (or raise) the KYPyMol PyQt panel."""
+    """Open (or raise) the KYMol PyQt panel."""
     global _dialog
     if _dialog is None:
-        from .ui import KYPyMolDialog
-        _dialog = KYPyMolDialog(controller())
+        from .ui import KYMolDialog
+        _dialog = KYMolDialog(controller())
     _dialog.refresh_objects(keep_selection=True)
     _dialog.show()
     _dialog.raise_()
@@ -53,7 +53,7 @@ def _show_panel_from_shortcut():
     try:
         open_panel()
     except Exception as exc:  # PyMOL must remain usable if Qt is unavailable
-        print("[KYPyMol] Could not open panel: {}".format(exc))
+        print("[KYMol] Could not open panel: {}".format(exc))
 
 
 def __init_plugin__(app=None):
@@ -61,7 +61,7 @@ def __init_plugin__(app=None):
     from pymol import cmd
     from pymol.plugins import addmenuitemqt
 
-    addmenuitemqt("KYPyMol: Active Object Panel", open_panel)
+    addmenuitemqt("KYMol: Structure Review Panel", open_panel)
     cmd.extend("ky_sync_selection", ky_sync_selection)
     cmd.extend("ky_align_selected", ky_align_selected)
     cmd.extend("ky_color_selected", ky_color_selected)
@@ -70,4 +70,4 @@ def __init_plugin__(app=None):
     # ALT-A is the guaranteed global fallback for the panel's Shift+Alt+A.
     cmd.set_key("ALT-A", ky_align_selected)
     cmd.set_key("ALT-C", ky_color_selected)
-    print("[KYPyMol] v{} loaded. Plugin menu opens the panel; ALT-A aligns, ALT-C colors chains.".format(__version__))
+    print("[KYMol] v{} loaded. Open Plugin > KYMol: Structure Review Panel.".format(__version__))
