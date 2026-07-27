@@ -7,7 +7,7 @@ created after using it opens normally without KYMol installed.
 
 from .core import KYMolController
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 _controller = None
 _dialog = None

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 
 from pymol.Qt import QtCore, QtGui, QtWidgets
@@ -11,6 +12,136 @@ from .core import KYMolError
 
 ACTIVE_GOLD = QtGui.QColor("#c99b12")
 ACTIVE_TEXT = QtGui.QColor("#1d1d1d")
+ITEM_KIND_ROLE = QtCore.Qt.UserRole + 2
+OBJECT_KIND = "object"
+GROUP_KIND = "group"
+
+
+class ObjectGroupTree(QtWidgets.QTreeWidget):
+    """Tree where Ctrl/Shift selects and an unmodified mouse drag moves objects."""
+
+    objectsDropped = QtCore.Signal(list, str)
+    MIME_TYPE = "application/x-kymol-object-names"
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setHeaderHidden(True)
+        self.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+        self.setDragDropMode(QtWidgets.QAbstractItemView.DragDrop)
+        self.setDefaultDropAction(QtCore.Qt.MoveAction)
+        self._drag_start = None
+        self._drag_item = None
+        self._delegated_press = False
+
+    def object_items(self):
+        items = []
+        iterator = QtWidgets.QTreeWidgetItemIterator(self)
+        while iterator.value():
+            item = iterator.value()
+            if item.data(0, ITEM_KIND_ROLE) == OBJECT_KIND:
+                items.append(item)
+            iterator += 1
+        return items
+
+    # Compatibility helpers used by tests and by the former flat-list code.
+    def count(self):
+        return len(self.object_items())
+
+    def item(self, row):
+        items = self.object_items()
+        return items[row] if 0 <= row < len(items) else None
+
+    def mousePressEvent(self, event):
+        modifiers = event.modifiers()
+        self._delegated_press = bool(
+            modifiers & (QtCore.Qt.ControlModifier | QtCore.Qt.ShiftModifier)
+        )
+        if self._delegated_press:
+            self._drag_start = None
+            self._drag_item = None
+            super().mousePressEvent(event)
+            return
+        self._drag_start = event.pos()
+        self._drag_item = self.itemAt(event.pos())
+        if self._drag_item is not None:
+            self.setCurrentItem(
+                self._drag_item,
+                0,
+                QtCore.QItemSelectionModel.NoUpdate,
+            )
+        event.accept()
+
+    def mouseMoveEvent(self, event):
+        if (
+            self._drag_start is None
+            or self._drag_item is None
+            or not (event.buttons() & QtCore.Qt.LeftButton)
+            or self._drag_item.data(0, ITEM_KIND_ROLE) != OBJECT_KIND
+        ):
+            return
+        if (event.pos() - self._drag_start).manhattanLength() < QtWidgets.QApplication.startDragDistance():
+            return
+        if self._drag_item.isSelected():
+            names = [
+                item.data(0, QtCore.Qt.UserRole)
+                for item in self.selectedItems()
+                if item.data(0, ITEM_KIND_ROLE) == OBJECT_KIND
+            ]
+        else:
+            names = [self._drag_item.data(0, QtCore.Qt.UserRole)]
+        mime = QtCore.QMimeData()
+        mime.setData(self.MIME_TYPE, json.dumps(names).encode("utf-8"))
+        drag = QtGui.QDrag(self)
+        drag.setMimeData(mime)
+        drag.exec_(QtCore.Qt.MoveAction)
+        self._drag_start = None
+        self._drag_item = None
+
+    def mouseReleaseEvent(self, event):
+        if self._delegated_press:
+            super().mouseReleaseEvent(event)
+        else:
+            if (
+                self._drag_item is not None
+                and self._drag_item.data(0, ITEM_KIND_ROLE) == GROUP_KIND
+            ):
+                self._drag_item.setExpanded(not self._drag_item.isExpanded())
+            event.accept()
+        self._drag_start = None
+        self._drag_item = None
+        self._delegated_press = False
+
+    def _drop_group(self, position):
+        item = self.itemAt(position)
+        if item is not None and item.data(0, ITEM_KIND_ROLE) == OBJECT_KIND:
+            item = item.parent()
+        if item is not None and item.data(0, ITEM_KIND_ROLE) == GROUP_KIND:
+            return item.data(0, QtCore.Qt.UserRole)
+        return None
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasFormat(self.MIME_TYPE):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasFormat(self.MIME_TYPE) and self._drop_group(event.pos()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        group_name = self._drop_group(event.pos())
+        if not group_name or not event.mimeData().hasFormat(self.MIME_TYPE):
+            event.ignore()
+            return
+        names = json.loads(bytes(event.mimeData().data(self.MIME_TYPE)).decode("utf-8"))
+        self.objectsDropped.emit(names, group_name)
+        event.acceptProposedAction()
 
 
 class ActiveObjectDelegate(QtWidgets.QStyledItemDelegate):
@@ -32,7 +163,13 @@ class KYMolDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self.controller = controller
         self.setWindowTitle("KYMol — Structure Review")
-        self.setMinimumSize(820, 620)
+        flags = self.windowFlags()
+        flags |= QtCore.Qt.WindowMinimizeButtonHint
+        flags &= ~QtCore.Qt.WindowContextHelpButtonHint
+        self.setWindowFlags(flags)
+        self.setSizeGripEnabled(True)
+        self.setMinimumSize(500, 400)
+        self.resize(820, 620)
         self._build_ui()
         self._install_shortcuts()
         self.refresh_objects()
@@ -40,35 +177,51 @@ class KYMolDialog(QtWidgets.QDialog):
     def _build_ui(self):
         layout = QtWidgets.QVBoxLayout(self)
         intro = QtWidgets.QLabel(
-            "Select objects here with Ctrl/Shift. The last clicked selected row is the "
-            "<b>gold active target</b>; all structure operations below use this panel state."
+            "Use <b>Ctrl/Shift</b> to select objects; the last selected row is the "
+            "<b>gold active target</b>. Press M to create a folder. Plain mouse drag moves "
+            "objects into folders without changing the selection."
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
-        self.object_list = QtWidgets.QListWidget()
-        self.object_list.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        self.object_list = ObjectGroupTree()
         self.object_list.setItemDelegate(ActiveObjectDelegate(self.object_list))
         self.object_list.itemSelectionChanged.connect(self._on_selection_changed)
         self.object_list.currentItemChanged.connect(self._on_current_item_changed)
+        self.object_list.itemDoubleClicked.connect(self._on_item_double_clicked)
+        self.object_list.objectsDropped.connect(self._move_objects_to_group)
         layout.addWidget(self.object_list, 1)
 
-        line = QtWidgets.QHBoxLayout()
+        object_actions = QtWidgets.QHBoxLayout()
         self.refresh_button = QtWidgets.QPushButton("Refresh objects")
         self.sync_button = QtWidgets.QPushButton("Import PyMOL selection (optional)")
         self.refresh_button.clicked.connect(lambda: self.refresh_objects(keep_selection=True))
         self.sync_button.clicked.connect(self.sync_from_pymol)
-        line.addWidget(self.refresh_button)
-        line.addWidget(self.sync_button)
-        line.addStretch(1)
-        line.addWidget(QtWidgets.QLabel("Shared chain (optional):"))
+        object_actions.addWidget(self.refresh_button)
+        object_actions.addWidget(self.sync_button)
+        object_actions.addStretch(1)
+        layout.addLayout(object_actions)
+
+        object_edit_actions = QtWidgets.QHBoxLayout()
+        self.create_group_button = QtWidgets.QPushButton("Create group (M)")
+        self.rename_button = QtWidgets.QPushButton("Rename active (F2)")
+        self.create_group_button.clicked.connect(self.create_group)
+        self.rename_button.clicked.connect(self.rename_active)
+        object_edit_actions.addWidget(self.create_group_button)
+        object_edit_actions.addWidget(self.rename_button)
+        object_edit_actions.addStretch(1)
+        layout.addLayout(object_edit_actions)
+
+        chain_line = QtWidgets.QHBoxLayout()
+        chain_line.addWidget(QtWidgets.QLabel("Shared chain (optional):"))
         self.chain_edit = QtWidgets.QLineEdit()
         self.chain_edit.setPlaceholderText("e.g. A")
         self.chain_edit.setMaximumWidth(100)
-        line.addWidget(self.chain_edit)
-        layout.addLayout(line)
+        chain_line.addWidget(self.chain_edit)
+        chain_line.addStretch(1)
+        layout.addLayout(chain_line)
 
-        align_line = QtWidgets.QHBoxLayout()
+        align_settings = QtWidgets.QHBoxLayout()
         self.method_combo = QtWidgets.QComboBox()
         self.method_combo.addItems(["super", "align", "cealign"])
         self.scope_combo = QtWidgets.QComboBox()
@@ -81,17 +234,22 @@ class KYMolDialog(QtWidgets.QDialog):
         self.align_button.clicked.connect(self.align)
         self.color_button = QtWidgets.QPushButton("Color chains (Alt+C)")
         self.color_button.clicked.connect(self.color_chains)
-        align_line.addWidget(QtWidgets.QLabel("Method:"))
-        align_line.addWidget(self.method_combo)
-        align_line.addWidget(self.scope_combo, 1)
-        align_line.addWidget(self.align_button)
-        align_line.addWidget(self.color_button)
-        layout.addLayout(align_line)
+        align_settings.addWidget(QtWidgets.QLabel("Method:"))
+        align_settings.addWidget(self.method_combo)
+        align_settings.addWidget(self.scope_combo, 1)
+        layout.addLayout(align_settings)
 
-        display_line = QtWidgets.QHBoxLayout()
+        align_actions = QtWidgets.QHBoxLayout()
+        align_actions.addWidget(self.align_button)
+        align_actions.addWidget(self.color_button)
+        align_actions.addStretch(1)
+        layout.addLayout(align_actions)
+
+        display_grid = QtWidgets.QGridLayout()
         self.show_button = QtWidgets.QPushButton("Show selected")
-        self.hide_button = QtWidgets.QPushButton("Hide selected")
-        self.only_button = QtWidgets.QPushButton("Only selected")
+        self.hide_button = QtWidgets.QPushButton("Hide selected (H)")
+        self.only_button = QtWidgets.QPushButton("Only selected (/)")
+        self.show_all_button = QtWidgets.QPushButton("Show all (Alt+H)")
         self.focus_button = QtWidgets.QPushButton("Focus active")
         self.delete_button = QtWidgets.QPushButton("Delete selected (X / Del)")
         self.delete_button.setStyleSheet(
@@ -100,31 +258,36 @@ class KYMolDialog(QtWidgets.QDialog):
         self.show_button.clicked.connect(lambda: self.display_selected("show"))
         self.hide_button.clicked.connect(lambda: self.display_selected("hide"))
         self.only_button.clicked.connect(lambda: self.display_selected("only"))
+        self.show_all_button.clicked.connect(self.show_all_objects)
         self.focus_button.clicked.connect(self.focus_active)
         self.delete_button.clicked.connect(self.delete_selected)
-        display_line.addWidget(self.show_button)
-        display_line.addWidget(self.hide_button)
-        display_line.addWidget(self.only_button)
-        display_line.addWidget(self.focus_button)
-        display_line.addStretch(1)
-        display_line.addWidget(self.delete_button)
-        layout.addLayout(display_line)
+        display_grid.addWidget(self.show_button, 0, 0)
+        display_grid.addWidget(self.hide_button, 0, 1)
+        display_grid.addWidget(self.only_button, 0, 2)
+        display_grid.addWidget(self.focus_button, 1, 0)
+        display_grid.addWidget(self.show_all_button, 1, 1)
+        display_grid.addWidget(self.delete_button, 1, 2)
+        layout.addLayout(display_grid)
 
-        export_line = QtWidgets.QHBoxLayout()
+        export_mode_line = QtWidgets.QHBoxLayout()
         self.export_mode = QtWidgets.QComboBox()
         self.export_mode.addItem("Active object / chain field", True)
         self.export_mode.addItem("PyMOL atom selection within active (optional)", False)
+        export_mode_line.addWidget(self.export_mode, 1)
+        layout.addLayout(export_mode_line)
+
+        export_actions = QtWidgets.QHBoxLayout()
         self.export_pdb = QtWidgets.QPushButton("Export PDB")
         self.export_cif = QtWidgets.QPushButton("Export CIF")
         self.copy_fasta_button = QtWidgets.QPushButton("Show / Copy FASTA")
         self.export_pdb.clicked.connect(lambda: self.export("pdb"))
         self.export_cif.clicked.connect(lambda: self.export("cif"))
         self.copy_fasta_button.clicked.connect(self.copy_fasta)
-        export_line.addWidget(self.export_mode, 1)
-        export_line.addWidget(self.export_pdb)
-        export_line.addWidget(self.export_cif)
-        export_line.addWidget(self.copy_fasta_button)
-        layout.addLayout(export_line)
+        export_actions.addWidget(self.export_pdb)
+        export_actions.addWidget(self.export_cif)
+        export_actions.addWidget(self.copy_fasta_button)
+        export_actions.addStretch(1)
+        layout.addLayout(export_actions)
 
         self.sequence_preview = QtWidgets.QPlainTextEdit()
         self.sequence_preview.setReadOnly(True)
@@ -154,22 +317,48 @@ class KYMolDialog(QtWidgets.QDialog):
         self.delete_key_shortcut = QtWidgets.QShortcut(QtGui.QKeySequence("Delete"), self.object_list)
         self.delete_key_shortcut.setContext(QtCore.Qt.WidgetWithChildrenShortcut)
         self.delete_key_shortcut.activated.connect(self.delete_selected)
+        self.hide_shortcut = QtWidgets.QShortcut(QtGui.QKeySequence("H"), self.object_list)
+        self.hide_shortcut.setContext(QtCore.Qt.WidgetWithChildrenShortcut)
+        self.hide_shortcut.activated.connect(lambda: self.display_selected("hide"))
+        self.show_all_shortcut = QtWidgets.QShortcut(QtGui.QKeySequence("Alt+H"), self)
+        self.show_all_shortcut.setContext(QtCore.Qt.ApplicationShortcut)
+        self.show_all_shortcut.activated.connect(self.show_all_objects)
+        self.only_shortcut = QtWidgets.QShortcut(QtGui.QKeySequence("/"), self.object_list)
+        self.only_shortcut.setContext(QtCore.Qt.WidgetWithChildrenShortcut)
+        self.only_shortcut.activated.connect(lambda: self.display_selected("only"))
+        self.group_shortcut = QtWidgets.QShortcut(QtGui.QKeySequence("M"), self.object_list)
+        self.group_shortcut.setContext(QtCore.Qt.WidgetWithChildrenShortcut)
+        self.group_shortcut.activated.connect(self.create_group)
+        self.rename_shortcut = QtWidgets.QShortcut(QtGui.QKeySequence("F2"), self.object_list)
+        self.rename_shortcut.setContext(QtCore.Qt.WidgetWithChildrenShortcut)
+        self.rename_shortcut.activated.connect(self.rename_active)
 
     def _selected_names(self):
-        return [item.data(QtCore.Qt.UserRole) for item in self.object_list.selectedItems()]
+        return [
+            item.data(0, QtCore.Qt.UserRole)
+            for item in self.object_list.selectedItems()
+            if item.data(0, ITEM_KIND_ROLE) == OBJECT_KIND
+        ]
 
     def _current_name(self):
         item = self.object_list.currentItem()
-        return item.data(QtCore.Qt.UserRole) if item else None
+        if item and item.data(0, ITEM_KIND_ROLE) == OBJECT_KIND:
+            return item.data(0, QtCore.Qt.UserRole)
+        return None
+
+    def _current_group(self):
+        item = self.object_list.currentItem()
+        if item and item.data(0, ITEM_KIND_ROLE) == GROUP_KIND:
+            return item.data(0, QtCore.Qt.UserRole)
+        return None
 
     def _apply_active_style(self):
         active = self.controller.state.active
-        for row in range(self.object_list.count()):
-            item = self.object_list.item(row)
-            is_active = item.data(QtCore.Qt.UserRole) == active
-            item.setData(QtCore.Qt.UserRole + 1, is_active)
-            item.setBackground(QtGui.QBrush(ACTIVE_GOLD) if is_active else QtGui.QBrush())
-            item.setForeground(QtGui.QBrush(ACTIVE_TEXT) if is_active else QtGui.QBrush())
+        for item in self.object_list.object_items():
+            is_active = item.data(0, QtCore.Qt.UserRole) == active
+            item.setData(0, QtCore.Qt.UserRole + 1, is_active)
+            item.setBackground(0, QtGui.QBrush(ACTIVE_GOLD) if is_active else QtGui.QBrush())
+            item.setForeground(0, QtGui.QBrush(ACTIVE_TEXT) if is_active else QtGui.QBrush())
         self.object_list.viewport().update()
 
     def _set_status(self, message, error=False):
@@ -192,17 +381,54 @@ class KYMolDialog(QtWidgets.QDialog):
         active = self.controller.state.active if keep_selection else None
         self.object_list.blockSignals(True)
         self.object_list.clear()
-        for name in self.controller.molecular_objects():
-            item = QtWidgets.QListWidgetItem(name)
-            item.setData(QtCore.Qt.UserRole, name)
-            self.object_list.addItem(item)
-            if name in selected:
-                item.setSelected(True)
-            if name == active:
-                self.object_list.setCurrentItem(item)
+        objects = self.controller.molecular_objects()
+        grouped = set()
+        folder_icon = self.style().standardIcon(QtWidgets.QStyle.SP_DirIcon)
+        for group_name in self.controller.group_names():
+            group_item = QtWidgets.QTreeWidgetItem([group_name])
+            group_item.setData(0, QtCore.Qt.UserRole, group_name)
+            group_item.setData(0, ITEM_KIND_ROLE, GROUP_KIND)
+            group_item.setIcon(0, folder_icon)
+            group_item.setFlags(
+                QtCore.Qt.ItemIsEnabled
+                | QtCore.Qt.ItemIsSelectable
+                | QtCore.Qt.ItemIsDropEnabled
+            )
+            self.object_list.addTopLevelItem(group_item)
+            for name in self.controller.group_members(group_name):
+                if name not in objects or name in grouped:
+                    continue
+                grouped.add(name)
+                item = self._new_object_item(name)
+                group_item.addChild(item)
+                self._restore_item_state(item, name, selected, active)
+            group_item.setExpanded(True)
+        for name in objects:
+            if name in grouped:
+                continue
+            item = self._new_object_item(name)
+            self.object_list.addTopLevelItem(item)
+            self._restore_item_state(item, name, selected, active)
         self.object_list.blockSignals(False)
         self._on_selection_changed()
         self._apply_active_style()
+
+    def _new_object_item(self, name):
+        item = QtWidgets.QTreeWidgetItem([name])
+        item.setData(0, QtCore.Qt.UserRole, name)
+        item.setData(0, ITEM_KIND_ROLE, OBJECT_KIND)
+        item.setFlags(
+            QtCore.Qt.ItemIsEnabled
+            | QtCore.Qt.ItemIsSelectable
+            | QtCore.Qt.ItemIsDragEnabled
+        )
+        return item
+
+    def _restore_item_state(self, item, name, selected, active):
+        if name in selected:
+            item.setSelected(True)
+        if name == active:
+            self.object_list.setCurrentItem(item)
 
     def sync_from_pymol(self):
         def action():
@@ -220,10 +446,25 @@ class KYMolDialog(QtWidgets.QDialog):
         self._set_status(self.controller.status_text())
 
     def _on_current_item_changed(self, current, previous):
-        if current and current.isSelected():
-            self.controller.set_active(current.data(QtCore.Qt.UserRole))
+        if (
+            current
+            and current.data(0, ITEM_KIND_ROLE) == OBJECT_KIND
+            and current.isSelected()
+        ):
+            self.controller.set_active(current.data(0, QtCore.Qt.UserRole))
             self._apply_active_style()
             self._set_status(self.controller.status_text())
+
+    def _on_item_double_clicked(self, item, column):
+        if item.data(0, ITEM_KIND_ROLE) != GROUP_KIND:
+            return
+        group_name = item.data(0, QtCore.Qt.UserRole)
+
+        def action():
+            self.controller.select_group(group_name)
+            self.refresh_objects(keep_selection=True)
+
+        self._run(action)
 
     def align(self):
         self._run(lambda: self.controller.align_selected(
@@ -236,10 +477,69 @@ class KYMolDialog(QtWidgets.QDialog):
         self._run(self.controller.color_selected_by_chain)
 
     def display_selected(self, mode):
-        self._run(lambda: self.controller.display_selected(mode))
+        group_name = self._current_group()
+        if group_name:
+            self._run(lambda: self.controller.display_group(group_name, mode))
+        else:
+            self._run(lambda: self.controller.display_selected(mode))
+
+    def show_all_objects(self):
+        self._run(self.controller.show_all_objects)
 
     def focus_active(self):
         self._run(self.controller.focus_active)
+
+    def create_group(self):
+        if not self.controller.state.selected:
+            self._set_status("Select objects with Ctrl/Shift before creating a group.", error=True)
+            return
+        default_name = self.controller.next_group_name()
+        group_name, accepted = QtWidgets.QInputDialog.getText(
+            self,
+            "Create KYMol group",
+            "Group name:",
+            QtWidgets.QLineEdit.Normal,
+            default_name,
+        )
+        if not accepted:
+            return
+
+        def action():
+            created = self.controller.create_group(group_name)
+            self.refresh_objects(keep_selection=True)
+            return created
+
+        self._run(action)
+
+    def rename_active(self):
+        active = self.controller.state.active
+        if not active:
+            self._set_status("Select an active object before renaming.", error=True)
+            return
+        new_name, accepted = QtWidgets.QInputDialog.getText(
+            self,
+            "Rename active object",
+            "New object name:",
+            QtWidgets.QLineEdit.Normal,
+            active,
+        )
+        if not accepted:
+            return
+
+        def action():
+            renamed = self.controller.rename_active(new_name)
+            self.refresh_objects(keep_selection=True)
+            return renamed
+
+        self._run(action)
+
+    def _move_objects_to_group(self, object_names, group_name):
+        def action():
+            moved = self.controller.assign_objects_to_group(object_names, group_name)
+            self.refresh_objects(keep_selection=True)
+            return moved
+
+        self._run(action)
 
     def delete_selected(self):
         names = list(self.controller.state.selected)
