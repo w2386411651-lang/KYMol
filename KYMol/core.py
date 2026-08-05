@@ -1,4 +1,4 @@
-"""PyMOL-independent controller logic for KYMol.
+"""PyMOL-independent controller logic for KyMol.
 
 The only PyMOL-specific dependency is injected as ``cmd``.  This makes the
 selection and alignment policy testable without launching a graphical PyMOL.
@@ -6,7 +6,11 @@ selection and alignment policy testable without launching a graphical PyMOL.
 
 from __future__ import annotations
 
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
+from contextlib import nullcontext
+import re
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 
@@ -29,17 +33,122 @@ class ActiveObjectState:
     active: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class ChainVisualState:
+    color_hex: str
+    hidden: bool
+
+
+@dataclass
+class HistoryEntry:
+    label: str
+    before_state: ActiveObjectState
+    after_state: ActiveObjectState
+    before_group_names: set
+    after_group_names: set
+
+
 class KYMolController:
-    """Maintain KYMol's ordered multi-selection and active target."""
+    """Maintain KyMol's ordered multi-selection and active target."""
 
     def __init__(self, cmd, reporter: Callable[[str], None] = print):
         self.cmd = cmd
         self.reporter = reporter
         self.state = ActiveObjectState()
         self._group_name_history = set()
+        self._undo_history: List[HistoryEntry] = []
+        self._redo_history: List[HistoryEntry] = []
+        self._history_serial = 0
 
     def report(self, message: str) -> None:
-        self.reporter("[KYMol] " + message)
+        self.reporter("[KyMol] " + message)
+
+    def _copy_state(self) -> ActiveObjectState:
+        return ActiveObjectState(list(self.state.selected), self.state.active)
+
+    def _run_undoable(self, description: str, operation):
+        self._history_serial += 1
+        label = "KyMol {}: {}".format(self._history_serial, description)
+        before_state = self._copy_state()
+        before_groups = set(self._group_name_history)
+        context_factory = getattr(self.cmd, "UndoSessionCM", None)
+        context = context_factory(label) if context_factory else nullcontext()
+        with context:
+            value = operation()
+        self._undo_history.append(
+            HistoryEntry(
+                label,
+                before_state,
+                self._copy_state(),
+                before_groups,
+                set(self._group_name_history),
+            )
+        )
+        self._redo_history.clear()
+        return value
+
+    def _native_history_labels(self) -> Tuple[str, str]:
+        inspect_history = getattr(self.cmd, "undo_current_undo_redo", None)
+        if inspect_history is None:
+            return "", ""
+        labels = inspect_history()
+        if not labels:
+            return "", ""
+        return labels[0] or "", labels[1] or ""
+
+    def _restore_history_entry(self, entry: HistoryEntry, use_after: bool) -> None:
+        requested = entry.after_state if use_after else entry.before_state
+        existing = set(self.molecular_objects())
+        selected = [name for name in requested.selected if name in existing]
+        active = requested.active if requested.active in selected else (
+            selected[-1] if selected else None
+        )
+        self.state = ActiveObjectState(selected, active)
+        self._group_name_history = set(
+            entry.after_group_names if use_after else entry.before_group_names
+        )
+
+    def undo(self) -> str:
+        native_undo = getattr(self.cmd, "undo", None)
+        if native_undo is None:
+            raise KYMolError("This PyMOL build does not provide undo support.")
+        can_inspect = getattr(self.cmd, "undo_current_undo_redo", None) is not None
+        next_undo, _ = self._native_history_labels()
+        if can_inspect and not next_undo:
+            raise KYMolError("Nothing to undo.")
+        native_undo()
+        description = next_undo or "the last PyMOL action"
+        if self._undo_history and (
+            not can_inspect or self._undo_history[-1].label == next_undo
+        ):
+            entry = self._undo_history.pop()
+            self._restore_history_entry(entry, use_after=False)
+            self._redo_history.append(entry)
+        else:
+            self.set_selection(self.state.selected, self.state.active)
+        self.report("Undid {}.".format(description))
+        return description
+
+    def redo(self) -> str:
+        native_redo = getattr(self.cmd, "redo", None)
+        if native_redo is None:
+            raise KYMolError("This PyMOL build does not provide redo support.")
+        can_inspect = getattr(self.cmd, "undo_current_undo_redo", None) is not None
+        _, next_redo = self._native_history_labels()
+        if can_inspect and not next_redo:
+            raise KYMolError("Nothing to redo.")
+        native_redo()
+        description = next_redo or "the last undone PyMOL action"
+        if self._redo_history and (
+            not can_inspect or self._redo_history[-1].label == next_redo
+        ):
+            entry = self._redo_history.pop()
+            self._restore_history_entry(entry, use_after=True)
+            self._undo_history.append(entry)
+        else:
+            self.set_selection(self.state.selected, self.state.active)
+        self.report("Redid {}.".format(description))
+        return description
 
     def molecular_objects(self) -> List[str]:
         return list(self.cmd.get_names_of_type("object:molecule"))
@@ -55,6 +164,57 @@ class KYMolController:
             if name in molecular
         ]
 
+    @staticmethod
+    def _rgb_to_hex(rgb) -> str:
+        channels = [max(0, min(255, round(float(value) * 255))) for value in rgb]
+        return "#{:02x}{:02x}{:02x}".format(*channels)
+
+    def chain_visual_states(
+        self, object_names: Optional[Iterable[str]] = None
+    ) -> Dict[Tuple[str, str], ChainVisualState]:
+        existing = self.molecular_objects()
+        requested = (
+            [name for name in object_names if name in existing]
+            if object_names is not None
+            else existing
+        )
+        if not requested:
+            return {}
+        selection = "(" + " or ".join(
+            "model {}".format(self._selection_value(name)) for name in requested
+        ) + ")"
+        rows = []
+        self.cmd.iterate(
+            selection,
+            "rows.append((model, chain, color, reps))",
+            space={"rows": rows},
+        )
+        grouped = defaultdict(list)
+        for object_name, chain, color_index, reps in rows:
+            grouped[(object_name, chain)].append((int(color_index), int(reps)))
+        enabled = set(self.cmd.get_names("objects", enabled_only=1))
+        color_cache = {}
+        states = {}
+        for object_name in requested:
+            for chain in self.cmd.get_chains(object_name):
+                chain_rows = grouped.get((object_name, chain), [])
+                visible_rows = [row for row in chain_rows if row[1]]
+                color_rows = visible_rows or chain_rows
+                if color_rows:
+                    color_index = Counter(row[0] for row in color_rows).most_common(1)[0][0]
+                    if color_index not in color_cache:
+                        color_cache[color_index] = self._rgb_to_hex(
+                            self.cmd.get_color_tuple(color_index)
+                        )
+                    color_hex = color_cache[color_index]
+                else:
+                    color_hex = "#808080"
+                hidden = object_name not in enabled or not any(
+                    reps for _, reps in chain_rows
+                )
+                states[(object_name, chain)] = ChainVisualState(color_hex, hidden)
+        return states
+
     def next_group_name(self, prefix: str = "P") -> str:
         existing = set(self.cmd.get_names("all")) | self._group_name_history
         index = 1
@@ -68,9 +228,137 @@ class KYMolController:
             raise KYMolError("{} name cannot be empty.".format(kind))
         if any(character.isspace() for character in name):
             raise KYMolError("{} name cannot contain whitespace.".format(kind))
+        legalize = getattr(self.cmd, "get_legal_name", None)
+        if legalize is not None:
+            legal_name = legalize(name)
+            if legal_name != name:
+                suggestion = legal_name or "{}_1".format(kind.lower())
+                raise KYMolError(
+                    "{} name '{}' is not valid in PyMOL. Try '{}'.".format(
+                        kind, name, suggestion
+                    )
+                )
         if name in self.cmd.get_names("all"):
             raise KYMolError("The name '{}' already exists.".format(name))
         return name
+
+    def _unique_object_name(self, base_name: str) -> str:
+        existing = set(self.cmd.get_names("all"))
+        if base_name not in existing:
+            return base_name
+        index = 2
+        while "{}_{}".format(base_name, index) in existing:
+            index += 1
+        return "{}_{}".format(base_name, index)
+
+    @staticmethod
+    def _selection_value(value: str) -> str:
+        return '"{}"'.format(value.replace("\\", "\\\\").replace('"', '\\"'))
+
+    def _normalize_chain_map(
+        self, chain_map: Dict[str, Iterable[str]]
+    ) -> Dict[str, List[str]]:
+        existing = set(self.molecular_objects())
+        normalized = {}
+        for object_name, requested_chains in chain_map.items():
+            if object_name not in existing:
+                raise KYMolError(
+                    "The source object '{}' no longer exists.".format(object_name)
+                )
+            available = list(self.cmd.get_chains(object_name))
+            chosen = []
+            for chain in requested_chains:
+                if chain in available and chain not in chosen:
+                    chosen.append(chain)
+            if chosen:
+                normalized[object_name] = chosen
+        if not normalized:
+            raise KYMolError("Choose at least one chain before copying.")
+        return normalized
+
+    def _chain_object_selection(
+        self, object_name: str, chains: Iterable[str]
+    ) -> str:
+        chain_terms = [
+            "chain {}".format(self._selection_value(chain)) for chain in chains
+        ]
+        return '(model {} and ({}))'.format(
+            self._selection_value(object_name), " or ".join(chain_terms)
+        )
+
+    def _default_chain_result_name(
+        self, object_name: str, chains: Iterable[str], operation: str
+    ) -> str:
+        suffix = "_".join(
+            re.sub(r"[^A-Za-z0-9]+", "", chain) or "blank" for chain in chains
+        )
+        return "{}_{}_{}".format(object_name, suffix, operation)
+
+    def copy_chains(
+        self,
+        chain_map: Dict[str, Iterable[str]],
+        requested_name: str = "",
+    ) -> List[str]:
+        normalized = self._normalize_chain_map(chain_map)
+        if requested_name and len(normalized) != 1:
+            raise KYMolError(
+                "A custom name can only be used when copying chains from one object."
+            )
+
+        def operation():
+            created = []
+            for object_name, chains in normalized.items():
+                if requested_name:
+                    new_name = self._validate_new_name(requested_name, "Object")
+                else:
+                    base_name = self._default_chain_result_name(
+                        object_name, chains, "copy"
+                    )
+                    new_name = self._unique_object_name(base_name)
+                self.cmd.create(
+                    new_name,
+                    self._chain_object_selection(object_name, chains),
+                    zoom=-1,
+                )
+                created.append(new_name)
+            self.state = ActiveObjectState(created, created[-1])
+            self.report("Copied chains into {} new object(s).".format(len(created)))
+            return created
+
+        return self._run_undoable("Copy chains", operation)
+
+    def cut_chains(
+        self,
+        chain_map: Dict[str, Iterable[str]],
+        requested_name: str = "",
+    ) -> List[str]:
+        normalized = self._normalize_chain_map(chain_map)
+        if requested_name and len(normalized) != 1:
+            raise KYMolError(
+                "A custom name can only be used when cutting chains from one object."
+            )
+
+        def operation():
+            created = []
+            for object_name, chains in normalized.items():
+                if requested_name:
+                    new_name = self._validate_new_name(requested_name, "Object")
+                else:
+                    base_name = self._default_chain_result_name(
+                        object_name, chains, "cut"
+                    )
+                    new_name = self._unique_object_name(base_name)
+                self.cmd.extract(
+                    new_name,
+                    self._chain_object_selection(object_name, chains),
+                    zoom=-1,
+                )
+                created.append(new_name)
+            self.state = ActiveObjectState(created, created[-1])
+            self.report("Cut chains into {} new object(s).".format(len(created)))
+            return created
+
+        return self._run_undoable("Cut chains", operation)
 
     def assign_objects_to_group(self, object_names: Iterable[str], group_name: str) -> List[str]:
         if group_name not in self.group_names():
@@ -82,9 +370,16 @@ class KYMolController:
                 members.append(name)
         if not members:
             raise KYMolError("Choose at least one existing object to move into the group.")
-        self.cmd.group(group_name, " ".join(members), action="add")
-        self.report("Moved {} object(s) into group {}.".format(len(members), group_name))
-        return members
+        def operation():
+            self.cmd.group(group_name, " ".join(members), action="add")
+            self.report(
+                "Moved {} object(s) into group {}.".format(
+                    len(members), group_name
+                )
+            )
+            return members
+
+        return self._run_undoable("Move objects to group", operation)
 
     def create_group(self, group_name: str = "") -> str:
         existing = set(self.molecular_objects())
@@ -95,10 +390,17 @@ class KYMolController:
         if requested_name in self._group_name_history:
             raise KYMolError("The group name '{}' was already used in this session.".format(requested_name))
         group_name = self._validate_new_name(requested_name, "Group")
-        self.cmd.group(group_name, " ".join(selected), action="add")
-        self._group_name_history.add(group_name)
-        self.report("Created group {} with {} object(s).".format(group_name, len(selected)))
-        return group_name
+        def operation():
+            self.cmd.group(group_name, " ".join(selected), action="add")
+            self._group_name_history.add(group_name)
+            self.report(
+                "Created group {} with {} object(s).".format(
+                    group_name, len(selected)
+                )
+            )
+            return group_name
+
+        return self._run_undoable("Create group", operation)
 
     def select_group(self, group_name: str) -> ActiveObjectState:
         members = self.group_members(group_name)
@@ -110,20 +412,30 @@ class KYMolController:
         members = self.group_members(group_name)
         if not members:
             raise KYMolError("The group '{}' contains no molecular objects.".format(group_name))
-        if mode == "only":
-            self.cmd.disable("all")
-            for name in members:
-                self.cmd.enable(name)
-        elif mode == "show":
-            for name in members:
-                self.cmd.enable(name)
-        elif mode == "hide":
-            for name in members:
-                self.cmd.disable(name)
-        else:
+        if mode not in ("only", "show", "hide"):
             raise KYMolError("Display mode must be show, hide, or only.")
-        self.report("{} group {} ({} object(s)).".format(mode.title(), group_name, len(members)))
-        return members
+
+        def operation():
+            if mode == "only":
+                self.cmd.disable("all")
+                for name in members:
+                    self.cmd.enable(name)
+            elif mode == "show":
+                for name in members:
+                    self.cmd.enable(name)
+            else:
+                for name in members:
+                    self.cmd.disable(name)
+            self.report(
+                "{} group {} ({} object(s)).".format(
+                    mode.title(), group_name, len(members)
+                )
+            )
+            return members
+
+        return self._run_undoable(
+            "{} group".format(mode.title()), operation
+        )
 
     def set_selection(self, object_names: Iterable[str], active: Optional[str] = None) -> ActiveObjectState:
         valid = set(self.molecular_objects())
@@ -146,7 +458,7 @@ class KYMolController:
 
     def status_text(self) -> str:
         if not self.state.selected:
-            return "No KYMol objects selected. Select objects in the panel or import a PyMOL selection."
+            return "No KyMol objects selected. Select objects in the panel or import a PyMOL selection."
         return "Selected: {}; active target: {}".format(
             ", ".join(self.state.selected), self.state.active or "none"
         )
@@ -164,13 +476,49 @@ class KYMolController:
         active = self.state.active
         mobiles = [name for name in self.state.selected if name != active]
         if active is None or active not in self.molecular_objects():
-            raise KYMolError("Choose an existing active target in the KYMol panel.")
+            raise KYMolError("Choose an existing active target in the KyMol panel.")
         if not mobiles:
             raise KYMolError("Select the active target and at least one mobile object.")
         return mobiles, active
 
     def _chain_selection(self, object_name: str, chain: str) -> str:
-        return "({} and chain {} and polymer.protein and name CA)".format(object_name, chain)
+        return "(model {} and chain {} and polymer.protein and name CA)".format(
+            self._selection_value(object_name), self._selection_value(chain)
+        )
+
+    def _chain_sequence(self, object_name: str, chain: str) -> str:
+        fasta = self.cmd.get_fastastr(self._chain_selection(object_name, chain))
+        return "".join(
+            line.strip()
+            for line in fasta.splitlines()
+            if line.strip() and not line.startswith(">")
+        )
+
+    def _best_sequence_chain_pair(
+        self, mobile: str, target: str, preferred_target_chain: str = ""
+    ) -> Optional[Tuple[str, str, float]]:
+        mobile_chains = list(self.cmd.get_chains(mobile))
+        target_chains = list(self.cmd.get_chains(target))
+        if preferred_target_chain:
+            target_chains = [
+                chain for chain in target_chains if chain == preferred_target_chain
+            ]
+        best = None
+        for mobile_chain in mobile_chains:
+            mobile_sequence = self._chain_sequence(mobile, mobile_chain)
+            if not mobile_sequence:
+                continue
+            for target_chain in target_chains:
+                target_sequence = self._chain_sequence(target, target_chain)
+                if not target_sequence:
+                    continue
+                score = SequenceMatcher(
+                    None, mobile_sequence, target_sequence, autojunk=False
+                ).ratio()
+                candidate = (mobile_chain, target_chain, score)
+                if best is None or score > best[2]:
+                    best = candidate
+        return best
 
     def _common_chain(self, mobile: str, target: str, preferred: str = "") -> Optional[str]:
         mobile_chains = set(self.cmd.get_chains(mobile))
@@ -181,8 +529,8 @@ class KYMolController:
         return common[0] if common else None
 
     def _current_selection_pair(self, mobile: str, target: str) -> Optional[Tuple[str, str]]:
-        mobile_sel = "({} and sele and polymer.protein and name CA)".format(mobile)
-        target_sel = "({} and sele and polymer.protein and name CA)".format(target)
+        mobile_sel = "(model {} and sele and polymer.protein and name CA)".format(mobile)
+        target_sel = "(model {} and sele and polymer.protein and name CA)".format(target)
         if self.cmd.count_atoms(mobile_sel) >= 3 and self.cmd.count_atoms(target_sel) >= 3:
             return mobile_sel, target_sel
         return None
@@ -195,113 +543,201 @@ class KYMolController:
             if pair:
                 return pair[0], pair[1], "current selection"
             raise KYMolError("Current selection needs at least 3 protein CA atoms in every object.")
-        if scope in ("auto", "common_chain"):
+        if scope == "auto":
+            best = self._best_sequence_chain_pair(mobile, target, chain)
+            if best:
+                mobile_chain, target_chain, score = best
+                return (
+                    self._chain_selection(mobile, mobile_chain),
+                    self._chain_selection(target, target_chain),
+                    "best sequence chains {} -> {} ({:.1%} identity/similarity)".format(
+                        mobile_chain, target_chain, score
+                    ),
+                )
+        if scope == "common_chain":
             shared = self._common_chain(mobile, target, chain)
             if shared:
                 return self._chain_selection(mobile, shared), self._chain_selection(target, shared), "common chain {}".format(shared)
-            if scope == "common_chain":
-                requested = " '{}'".format(chain) if chain else ""
-                raise KYMolError("No shared chain{} between {} and {}.".format(requested, mobile, target))
-        return "({} and polymer.protein and name CA)".format(mobile), "({} and polymer.protein and name CA)".format(target), "whole object CA atoms"
+            requested = " '{}'".format(chain) if chain else ""
+            raise KYMolError("No shared chain{} between {} and {}.".format(requested, mobile, target))
+        return "(model {} and polymer.protein and name CA)".format(mobile), "(model {} and polymer.protein and name CA)".format(target), "whole object CA atoms"
 
-    def align_selected(self, method: str = "super", scope: str = "auto", chain: str = "") -> Dict[str, object]:
+    def align_selected(self, method: str = "align", scope: str = "auto", chain: str = "") -> Dict[str, object]:
         if method not in ("align", "super", "cealign"):
             raise KYMolError("Method must be align, super, or cealign.")
         mobiles, target = self._assert_alignment_ready()
-        results = {}
-        for mobile in mobiles:
-            mobile_sel, target_sel, reason = self._alignment_pair(mobile, target, scope, chain.strip())
-            self.report("Aligning {} -> {} using {} ({}, {}).".format(mobile, target, method, reason, mobile_sel))
-            # PyMOL's cealign reverses the target/mobile parameter order.
-            if method == "cealign":
-                results[mobile] = self.cmd.cealign(target_sel, mobile_sel)
-            else:
-                results[mobile] = getattr(self.cmd, method)(mobile_sel, target_sel)
-        self.report("Alignment complete: {} mobile object(s) -> {}.".format(len(mobiles), target))
-        return results
+
+        def operation():
+            results = {}
+            for mobile in mobiles:
+                mobile_sel, target_sel, reason = self._alignment_pair(
+                    mobile, target, scope, chain.strip()
+                )
+                self.report(
+                    "Aligning {} -> {} using {} ({}, {}).".format(
+                        mobile, target, method, reason, mobile_sel
+                    )
+                )
+                # PyMOL's cealign reverses the target/mobile parameter order.
+                if method == "cealign":
+                    results[mobile] = self.cmd.cealign(target_sel, mobile_sel)
+                else:
+                    results[mobile] = getattr(self.cmd, method)(
+                        mobile_sel, target_sel
+                    )
+            self.report(
+                "Alignment complete: {} mobile object(s) -> {}.".format(
+                    len(mobiles), target
+                )
+            )
+            return results
+
+        return self._run_undoable("Align objects", operation)
 
     def color_selected_by_chain(self) -> Dict[str, List[str]]:
         objects = self.state.selected
         if not objects:
-            raise KYMolError("Select at least one KYMol object before coloring.")
+            raise KYMolError("Select at least one KyMol object before coloring.")
         selection = "(" + " or ".join("model {}".format(name) for name in objects) + ")"
         chains = list(self.cmd.get_chains(selection))
-        for index, chain in enumerate(chains):
-            chain_token = '"{}"'.format(chain) if len(chain.split()) != 1 else chain
-            self.cmd.color(
-                PYMOL_CHAIN_COLOR_CYCLE[index % len(PYMOL_CHAIN_COLOR_CYCLE)],
-                "(chain {} and ({}))".format(chain_token, selection),
-            )
-        colored = {name: list(self.cmd.get_chains(name)) for name in objects}
-        self.report("Colored chains in {} object(s).".format(len(objects)))
-        return colored
+
+        def operation():
+            for index, chain in enumerate(chains):
+                chain_token = (
+                    '"{}"'.format(chain) if len(chain.split()) != 1 else chain
+                )
+                self.cmd.color(
+                    PYMOL_CHAIN_COLOR_CYCLE[index % len(PYMOL_CHAIN_COLOR_CYCLE)],
+                    "(chain {} and ({}))".format(chain_token, selection),
+                )
+            colored = {
+                name: list(self.cmd.get_chains(name)) for name in objects
+            }
+            self.report("Colored chains in {} object(s).".format(len(objects)))
+            return colored
+
+        return self._run_undoable("Color chains", operation)
 
     def display_selected(self, mode: str) -> List[str]:
         existing = set(self.molecular_objects())
         selected = [name for name in self.state.selected if name in existing]
         if not selected:
-            raise KYMolError("Select at least one existing KYMol object.")
-        if mode == "only":
-            self.cmd.disable("all")
-            for name in selected:
-                self.cmd.enable(name)
-        elif mode == "show":
-            for name in selected:
-                self.cmd.enable(name)
-        elif mode == "hide":
-            for name in selected:
-                self.cmd.disable(name)
-        else:
+            raise KYMolError("Select at least one existing KyMol object.")
+        if mode not in ("only", "show", "hide"):
             raise KYMolError("Display mode must be show, hide, or only.")
-        self.report("{} {} selected object(s).".format(mode.title(), len(selected)))
-        return selected
+
+        def operation():
+            if mode == "only":
+                self.cmd.disable("all")
+                for name in selected:
+                    self.cmd.enable(name)
+            elif mode == "show":
+                for name in selected:
+                    self.cmd.enable(name)
+            else:
+                for name in selected:
+                    self.cmd.disable(name)
+            self.report(
+                "{} {} selected object(s).".format(
+                    mode.title(), len(selected)
+                )
+            )
+            return selected
+
+        return self._run_undoable("{} objects".format(mode.title()), operation)
+
+    def toggle_objects_visibility(self, object_names: Iterable[str]) -> List[str]:
+        existing = set(self.molecular_objects())
+        objects = [name for name in object_names if name in existing]
+        if not objects:
+            raise KYMolError("Select at least one existing KyMol object.")
+        enabled = set(self.cmd.get_names("objects", enabled_only=1))
+        should_hide = any(name in enabled for name in objects)
+
+        def action():
+            operation = self.cmd.disable if should_hide else self.cmd.enable
+            for name in objects:
+                operation(name)
+            self.report(
+                "{} {} object(s).".format(
+                    "Hid" if should_hide else "Showed", len(objects)
+                )
+            )
+            return objects
+
+        return self._run_undoable("Toggle visibility", action)
+
+    def toggle_selected_visibility(self) -> List[str]:
+        return self.toggle_objects_visibility(self.state.selected)
+
+    def toggle_group_visibility(self, group_name: str) -> List[str]:
+        members = self.group_members(group_name)
+        if not members:
+            raise KYMolError("The group '{}' contains no molecular objects.".format(group_name))
+        return self.toggle_objects_visibility(members)
 
     def show_all_objects(self) -> List[str]:
         objects = self.molecular_objects()
-        for name in objects:
-            self.cmd.enable(name)
-        self.report("Showed all {} molecular object(s).".format(len(objects)))
-        return objects
+
+        def operation():
+            for name in objects:
+                self.cmd.enable(name)
+            self.report(
+                "Showed all {} molecular object(s).".format(len(objects))
+            )
+            return objects
+
+        return self._run_undoable("Show all objects", operation)
 
     def focus_active(self) -> str:
         active = self.state.active
         if active not in self.molecular_objects():
             raise KYMolError("Choose an existing active object first.")
-        self.cmd.orient(active)
-        self.report("Focused the PyMOL view on {}.".format(active))
-        return active
+
+        def operation():
+            self.cmd.orient(active)
+            self.report("Focused the PyMOL view on {}.".format(active))
+            return active
+
+        return self._run_undoable("Focus active object", operation)
 
     def rename_active(self, new_name: str) -> str:
         active = self.state.active
         if active not in self.molecular_objects():
             raise KYMolError("Choose an existing active object before renaming.")
         new_name = new_name.strip()
-        if not new_name:
-            raise KYMolError("Object name cannot be empty.")
-        if any(character.isspace() for character in new_name):
-            raise KYMolError("Object name cannot contain whitespace.")
         if new_name == active:
             return active
-        if new_name in self.cmd.get_names("all"):
-            raise KYMolError("The name '{}' already exists.".format(new_name))
-        self.cmd.set_name(active, new_name)
-        self.state.selected = [
-            new_name if name == active else name for name in self.state.selected
-        ]
-        self.state.active = new_name
-        self.report("Renamed {} to {}.".format(active, new_name))
-        return new_name
+        new_name = self._validate_new_name(new_name, "Object")
+        def operation():
+            self.cmd.set_name(active, new_name)
+            self.state.selected = [
+                new_name if name == active else name for name in self.state.selected
+            ]
+            self.state.active = new_name
+            self.report("Renamed {} to {}.".format(active, new_name))
+            return new_name
+
+        return self._run_undoable("Rename object", operation)
 
     def delete_selected(self) -> List[str]:
         existing = set(self.molecular_objects())
         deleted = [name for name in self.state.selected if name in existing]
         if not deleted:
-            raise KYMolError("Select at least one existing KYMol object before deleting.")
-        for name in deleted:
-            self.cmd.delete(name)
-        self.state = ActiveObjectState()
-        self.report("Deleted {} object(s) from the current PyMOL session.".format(len(deleted)))
-        return deleted
+            raise KYMolError("Select at least one existing KyMol object before deleting.")
+
+        def operation():
+            for name in deleted:
+                self.cmd.delete(name)
+            self.state = ActiveObjectState()
+            self.report(
+                "Deleted {} object(s) from the current PyMOL session.".format(
+                    len(deleted)
+                )
+            )
+            return deleted
+
+        return self._run_undoable("Delete objects", operation)
 
     def active_selection(self, whole_chain: bool = False, chain: str = "") -> str:
         active = self.state.active
