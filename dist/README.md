@@ -1,17 +1,9 @@
-# Installable release packages
+# Latest installable package
 
-These are the original PyMOL plugin ZIP files. Install them directly without extracting.
+[KyMol-0.7.0rc2.zip](KyMol-0.7.0rc2.zip) — 40,066 bytes. Install this ZIP directly through PyMOL's Plugin Manager without extracting it.
 
-| Version | Package | SHA-256 |
-|---|---|---|
-| 0.1.0 | [KYPyMol-0.1.0.zip](KYPyMol-0.1.0.zip) | `4B7F92899FBC993A6E4EA1B8A954824D4FA4DF1A85690A3B9C5C03CD38DCA512` |
-| 0.1.1 | [KYPyMol-0.1.1.zip](KYPyMol-0.1.1.zip) | `80EABE2A46EE5AB4BC93EEA193A8B0E330CBCC5F43ECF1C32177D571EC240B27` |
-| 0.2.0 | [KYMol-0.2.0.zip](KYMol-0.2.0.zip) | `8B8D4118C654E12C749EEAFD8C44ECF42412501D3B1F85713C4FCED27A616CA4` |
-| 0.3.0 | [KYMol-0.3.0.zip](KYMol-0.3.0.zip) | `C17FFCC34AAF0128DF74D35D7CB20562E788696667891B1B0E9232B83F2C18B3` |
-| 0.4.0 | [KYMol-0.4.0.zip](KYMol-0.4.0.zip) | `C8F5DD60C126CDD0C124A943E3D52F42484C30B2ACA2FA1C42B40C4135CA6B46` |
-| 0.5.0 | [KYMol-0.5.0.zip](KYMol-0.5.0.zip) | `4A5DF2FF410DD60A0717486D9E382A2BDB76404E057AC601D864221666812380` |
-| 0.6.0 | [KyMol-0.6.0.zip](KyMol-0.6.0.zip) | `2144F3D46384A46ADE7515A3ED341ABF4F6648CA7E1ED7577B857BAC3DF15D58` |
-| 0.6.1 | [KyMol-0.6.1.zip](KyMol-0.6.1.zip) | `58D73BC4848B38C93A8A4D8F565DCF3621BB35AF42FAEAC3D314AF8E3C3CA459` |
+SHA-256: `320bed662a369abf463ed005c8f323bf7abe44ceb24b4310430ee017c5095d9e`.
 
-Author: RuoyuLiu  
-License: MIT
+The [manifest](KyMol-0.7.0rc2.manifest.json) lists all eight package members and their hashes. See the [GitHub release](https://github.com/w2386411651-lang/KYMol/releases/tag/v0.7.0rc2), [installation instructions](../INSTALLATION.zh-CN.md) and [verification summary](../VERIFICATION.md).
+
+Only the latest package is kept here. The source change history remains available in Git.

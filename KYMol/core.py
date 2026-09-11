@@ -13,6 +13,8 @@ from contextlib import nullcontext
 import re
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
+from .provenance import get_tracker
+
 
 # Exact cycle used by this PyMOL installation's pymol.util.cbc/color_chains.
 PYMOL_CHAIN_COLOR_CYCLE = (
@@ -59,6 +61,7 @@ class KYMolController:
         self._undo_history: List[HistoryEntry] = []
         self._redo_history: List[HistoryEntry] = []
         self._history_serial = 0
+        self.sources = get_tracker(cmd)
 
     def report(self, message: str) -> None:
         self.reporter("[KyMol] " + message)
@@ -253,7 +256,15 @@ class KYMolController:
 
     @staticmethod
     def _selection_value(value: str) -> str:
-        return '"{}"'.format(value.replace("\\", "\\\\").replace('"', '\\"'))
+        # PyMOL still interprets *, + and comma as pattern/list operators
+        # inside quotes. Escape them so an actual mmCIF chain ID such as A+B
+        # cannot silently select chains A and B during a cut or export.
+        if '"' in value:
+            raise KYMolError("Identifiers containing double quotes cannot be safely selected by KyMol; rename that identifier before this operation.")
+        escaped = value.replace("\\", "\\\\")
+        for character in "*+,":
+            escaped = escaped.replace(character, "\\" + character)
+        return '"' + escaped + '"'
 
     def _normalize_chain_map(
         self, chain_map: Dict[str, Iterable[str]]
@@ -268,9 +279,18 @@ class KYMolController:
             available = list(self.cmd.get_chains(object_name))
             chosen = []
             for chain in requested_chains:
-                if chain in available and chain not in chosen:
+                if chain not in available:
+                    raise KYMolError(
+                        "Chain {!r} in '{}' no longer exists; refresh the chain selection.".format(
+                            chain, object_name
+                        )
+                    )
+                if chain not in chosen:
                     chosen.append(chain)
             if chosen:
+                # Validate literal identifiers for the entire request before
+                # copying or cutting the first object's atoms.
+                self._chain_object_selection(object_name, chosen)
                 normalized[object_name] = chosen
         if not normalized:
             raise KYMolError("Choose at least one chain before copying.")
@@ -308,6 +328,7 @@ class KYMolController:
         def operation():
             created = []
             for object_name, chains in normalized.items():
+                source_record = self.sources.capture([object_name])
                 if requested_name:
                     new_name = self._validate_new_name(requested_name, "Object")
                 else:
@@ -320,6 +341,7 @@ class KYMolController:
                     self._chain_object_selection(object_name, chains),
                     zoom=-1,
                 )
+                self.sources.apply(new_name, source_record)
                 created.append(new_name)
             self.state = ActiveObjectState(created, created[-1])
             self.report("Copied chains into {} new object(s).".format(len(created)))
@@ -341,6 +363,7 @@ class KYMolController:
         def operation():
             created = []
             for object_name, chains in normalized.items():
+                source_record = self.sources.capture([object_name])
                 if requested_name:
                     new_name = self._validate_new_name(requested_name, "Object")
                 else:
@@ -353,6 +376,7 @@ class KYMolController:
                     self._chain_object_selection(object_name, chains),
                     zoom=-1,
                 )
+                self.sources.apply(new_name, source_record)
                 created.append(new_name)
             self.state = ActiveObjectState(created, created[-1])
             self.report("Cut chains into {} new object(s).".format(len(created)))
@@ -450,6 +474,8 @@ class KYMolController:
         return self.state
 
     def set_active(self, object_name: str) -> ActiveObjectState:
+        if object_name not in self.molecular_objects():
+            raise KYMolError("Choose an existing molecular object as the active target.")
         if object_name not in self.state.selected:
             self.state.selected.append(object_name)
         self.state.active = object_name
@@ -474,11 +500,15 @@ class KYMolController:
 
     def _assert_alignment_ready(self) -> Tuple[List[str], str]:
         active = self.state.active
+        existing = set(self.molecular_objects())
         mobiles = [name for name in self.state.selected if name != active]
-        if active is None or active not in self.molecular_objects():
+        if active is None or active not in existing or active not in self.state.selected:
             raise KYMolError("Choose an existing active target in the KyMol panel.")
         if not mobiles:
             raise KYMolError("Select the active target and at least one mobile object.")
+        for mobile in mobiles:
+            if mobile not in existing:
+                raise KYMolError("The mobile object '{}' no longer exists; refresh the selection.".format(mobile))
         return mobiles, active
 
     def _chain_selection(self, object_name: str, chain: str) -> str:
@@ -495,8 +525,17 @@ class KYMolController:
         )
 
     def _best_sequence_chain_pair(
-        self, mobile: str, target: str, preferred_target_chain: str = ""
+        self, mobile: str, target: str, preferred_target_chain: str = "",
+        sequence_cache: Optional[Dict[Tuple[str, str], str]] = None,
     ) -> Optional[Tuple[str, str, float]]:
+        # This cache lasts only for one explicit alignment request. It avoids
+        # repeated target atom traversal, without stale sequence reuse after edits.
+        cache = sequence_cache if sequence_cache is not None else {}
+        def sequence(object_name, chain):
+            key = (object_name, chain)
+            if key not in cache:
+                cache[key] = self._chain_sequence(object_name, chain)
+            return cache[key]
         mobile_chains = list(self.cmd.get_chains(mobile))
         target_chains = list(self.cmd.get_chains(target))
         if preferred_target_chain:
@@ -504,12 +543,13 @@ class KYMolController:
                 chain for chain in target_chains if chain == preferred_target_chain
             ]
         best = None
+        best_count = 0
         for mobile_chain in mobile_chains:
-            mobile_sequence = self._chain_sequence(mobile, mobile_chain)
+            mobile_sequence = sequence(mobile, mobile_chain)
             if not mobile_sequence:
                 continue
             for target_chain in target_chains:
-                target_sequence = self._chain_sequence(target, target_chain)
+                target_sequence = sequence(target, target_chain)
                 if not target_sequence:
                     continue
                 score = SequenceMatcher(
@@ -518,6 +558,17 @@ class KYMolController:
                 candidate = (mobile_chain, target_chain, score)
                 if best is None or score > best[2]:
                     best = candidate
+                    best_count = 1
+                elif score == best[2]:
+                    best_count += 1
+        if best_count > 1:
+            self.report(
+                "Ambiguous automatic chain match: {} pairs share the best heuristic score for {} -> {}; "
+                "using {!r} -> {!r} in PyMOL chain order. Use a target-chain restriction, common-chain "
+                "or current-selection scope to resolve the intended mapping.".format(
+                    best_count, mobile, target, best[0], best[1]
+                )
+            )
         return best
 
     def _common_chain(self, mobile: str, target: str, preferred: str = "") -> Optional[str]:
@@ -529,13 +580,14 @@ class KYMolController:
         return common[0] if common else None
 
     def _current_selection_pair(self, mobile: str, target: str) -> Optional[Tuple[str, str]]:
-        mobile_sel = "(model {} and sele and polymer.protein and name CA)".format(mobile)
-        target_sel = "(model {} and sele and polymer.protein and name CA)".format(target)
+        mobile_sel = "(model {} and ?sele and polymer.protein and name CA)".format(self._selection_value(mobile))
+        target_sel = "(model {} and ?sele and polymer.protein and name CA)".format(self._selection_value(target))
         if self.cmd.count_atoms(mobile_sel) >= 3 and self.cmd.count_atoms(target_sel) >= 3:
             return mobile_sel, target_sel
         return None
 
-    def _alignment_pair(self, mobile: str, target: str, scope: str, chain: str) -> Tuple[str, str, str]:
+    def _alignment_pair(self, mobile: str, target: str, scope: str, chain: str,
+                        sequence_cache=None) -> Tuple[str, str, str]:
         if scope not in ("auto", "selection", "common_chain", "whole_object"):
             raise KYMolError("Unknown alignment scope: {}".format(scope))
         if scope == "selection":
@@ -544,35 +596,49 @@ class KYMolController:
                 return pair[0], pair[1], "current selection"
             raise KYMolError("Current selection needs at least 3 protein CA atoms in every object.")
         if scope == "auto":
-            best = self._best_sequence_chain_pair(mobile, target, chain)
+            best = self._best_sequence_chain_pair(mobile, target, chain, sequence_cache)
             if best:
                 mobile_chain, target_chain, score = best
                 return (
                     self._chain_selection(mobile, mobile_chain),
                     self._chain_selection(target, target_chain),
-                    "best sequence chains {} -> {} ({:.1%} identity/similarity)".format(
+                    "best sequence chains {!r} -> {!r} ({:.1%} heuristic sequence-match ratio)".format(
                         mobile_chain, target_chain, score
                     ),
                 )
+            raise KYMolError(
+                "No protein chain pair between {} and {}{}; choose a valid chain or explicitly choose whole-object scope.".format(
+                    mobile, target, " for target chain {!r}".format(chain) if chain else ""
+                )
+            )
         if scope == "common_chain":
             shared = self._common_chain(mobile, target, chain)
-            if shared:
+            if shared is not None:
                 return self._chain_selection(mobile, shared), self._chain_selection(target, shared), "common chain {}".format(shared)
             requested = " '{}'".format(chain) if chain else ""
             raise KYMolError("No shared chain{} between {} and {}.".format(requested, mobile, target))
-        return "(model {} and polymer.protein and name CA)".format(mobile), "(model {} and polymer.protein and name CA)".format(target), "whole object CA atoms"
+        return "(model {} and polymer.protein and name CA)".format(self._selection_value(mobile)), "(model {} and polymer.protein and name CA)".format(self._selection_value(target)), "whole object CA atoms"
 
     def align_selected(self, method: str = "align", scope: str = "auto", chain: str = "") -> Dict[str, object]:
         if method not in ("align", "super", "cealign"):
             raise KYMolError("Method must be align, super, or cealign.")
         mobiles, target = self._assert_alignment_ready()
+        # Resolve every scope before applying the first transform. A stale or
+        # invalid later mobile must not leave an earlier mobile already moved.
+        sequence_cache = {}
+        pairs = {}
+        for mobile in mobiles:
+            pair = self._alignment_pair(mobile, target, scope, chain.strip(), sequence_cache)
+            # PyMOL CE uses a default window of 8 and requires 2 * window atoms.
+            minimum = 16 if method == "cealign" else 3
+            if min(self.cmd.count_atoms(pair[0]), self.cmd.count_atoms(pair[1])) < minimum:
+                raise KYMolError("{} needs at least {} protein CA atoms in both {} and {}.".format(method, minimum, mobile, target))
+            pairs[mobile] = pair
 
         def operation():
             results = {}
             for mobile in mobiles:
-                mobile_sel, target_sel, reason = self._alignment_pair(
-                    mobile, target, scope, chain.strip()
-                )
+                mobile_sel, target_sel, reason = pairs[mobile]
                 self.report(
                     "Aligning {} -> {} using {} ({}, {}).".format(
                         mobile, target, method, reason, mobile_sel
@@ -598,14 +664,12 @@ class KYMolController:
         objects = self.state.selected
         if not objects:
             raise KYMolError("Select at least one KyMol object before coloring.")
-        selection = "(" + " or ".join("model {}".format(name) for name in objects) + ")"
+        selection = "(" + " or ".join("model {}".format(self._selection_value(name)) for name in objects) + ")"
         chains = list(self.cmd.get_chains(selection))
+        chain_tokens = [self._selection_value(chain) for chain in chains]
 
         def operation():
-            for index, chain in enumerate(chains):
-                chain_token = (
-                    '"{}"'.format(chain) if len(chain.split()) != 1 else chain
-                )
+            for index, chain_token in enumerate(chain_tokens):
                 self.cmd.color(
                     PYMOL_CHAIN_COLOR_CYCLE[index % len(PYMOL_CHAIN_COLOR_CYCLE)],
                     "(chain {} and ({}))".format(chain_token, selection),
@@ -741,21 +805,28 @@ class KYMolController:
 
     def active_selection(self, whole_chain: bool = False, chain: str = "") -> str:
         active = self.state.active
-        if not active:
-            raise KYMolError("Choose an active object first.")
+        if active not in self.molecular_objects():
+            raise KYMolError("Choose an existing active object first.")
+        model = "model {}".format(self._selection_value(active))
         if chain:
-            return "({} and chain {})".format(active, chain)
-        if whole_chain:
-            return active
-        if self.cmd.count_atoms("({} and sele)".format(active)):
-            return "({} and sele)".format(active)
-        return active
+            if chain not in self.cmd.get_chains(active):
+                raise KYMolError("Chain {!r} does not exist in active object '{}'.".format(chain, active))
+            selection = "({} and chain {})".format(model, self._selection_value(chain))
+        elif not whole_chain and self.cmd.count_atoms("({} and ?sele)".format(model)):
+            selection = "({} and ?sele)".format(model)
+        else:
+            selection = "({})".format(model)
+        if not self.cmd.count_atoms(selection):
+            raise KYMolError("The requested active-object selection contains no atoms.")
+        return selection
 
     def export_active(self, filename: str, file_format: str, whole_chain: bool = False, chain: str = "") -> str:
         file_format = file_format.lower()
         if file_format not in ("pdb", "cif"):
             raise KYMolError("Export format must be pdb or cif.")
         selection = self.active_selection(whole_chain=whole_chain, chain=chain)
+        if self.sources.is_source_path(filename, self.state.active):
+            raise KYMolError("This is an original source file. Choose a new export filename to preserve it.")
         self.cmd.save(filename, selection, format=file_format)
         self.report("Exported {} as {}.".format(selection, filename))
         return selection

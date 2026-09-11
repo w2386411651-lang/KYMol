@@ -180,6 +180,185 @@ class KYMolDialogTests(unittest.TestCase):
     def setUpClass(cls):
         cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
+    def test_default_chain_controls_fit_in_small_resizable_panel(self):
+        dialog = KYMolDialog(KYMolController(FakeCmd(), reporter=lambda message: None))
+        self.addCleanup(dialog.close)
+        dialog.show()
+        dialog.resize(540, 400)
+        self.app.processEvents()
+        self.assertLessEqual(dialog.height(), 420)
+        self.assertTrue(dialog.chain_actions.isVisible())
+        self.assertFalse(dialog.object_list.isColumnHidden(1))
+        self.assertGreaterEqual(dialog.object_list.height(), 96)
+        tree_bottom = dialog.object_list.mapTo(dialog, dialog.object_list.rect().bottomLeft()).y()
+        actions_top = dialog.chain_actions.mapTo(dialog, QtCore.QPoint()).y()
+        self.assertGreater(actions_top, tree_bottom)
+        self.assertGreater(dialog.tools_scroll.verticalScrollBar().maximum(), 0)
+
+    def test_opening_panel_keeps_an_existing_controller_selection(self):
+        controller = KYMolController(FakeCmd(), reporter=lambda message: None)
+        controller.set_selection(["model_1", "model_2"], "model_1")
+        dialog = KYMolDialog(controller)
+        self.addCleanup(dialog.close)
+        self.assertEqual(["model_1", "model_2"], controller.state.selected)
+        self.assertEqual("model_1", controller.state.active)
+        self.assertEqual("model_1", dialog._current_name())
+
+    def test_search_keyboard_cannot_trigger_chain_operations_or_structure_undo(self):
+        fake = FakeCmd()
+        controller = KYMolController(fake, reporter=lambda message: None)
+        controller.set_selection(["model_1"], "model_1")
+        controller.rename_active("model_renamed")
+        dialog = KYMolDialog(controller)
+        self.addCleanup(dialog.close)
+        dialog.show()
+        dialog.search_edit.setFocus()
+        self.app.processEvents()
+        QtTest.QTest.keyClicks(dialog.search_edit, "model")
+        self.assertEqual("1 / 3", dialog.search_count.text())
+        with patch.object(dialog, "_transform_selected_chains") as transform:
+            QtTest.QTest.keyClick(dialog.search_edit, QtCore.Qt.Key_Return)
+            self.assertEqual("2 / 3", dialog.search_count.text())
+            QtTest.QTest.keyClick(dialog.search_edit, QtCore.Qt.Key_Return, QtCore.Qt.ShiftModifier)
+            self.assertEqual("1 / 3", dialog.search_count.text())
+            transform.assert_not_called()
+        QtTest.QTest.keyClick(dialog.search_edit, QtCore.Qt.Key_Z, QtCore.Qt.ControlModifier)
+        self.assertIn("model_renamed", fake.objects)
+        self.assertEqual("", dialog.search_edit.text())
+        dialog.search_edit.setText("model")
+        QtTest.QTest.keyClick(dialog.search_edit, QtCore.Qt.Key_Escape)
+        self.assertEqual("", dialog.search_edit.text())
+        self.assertTrue(dialog.isVisible())
+
+    def test_search_many_long_names_after_refresh_does_not_scan_atoms(self):
+        fake = FakeCmd()
+        fake.objects = ["synthetic_result_{:03d}_very_long_model_name".format(index) for index in range(100)]
+        fake.chains = {name: ["A"] for name in fake.objects}
+        fake.groups = {"batch": fake.objects[:50]}
+        dialog = KYMolDialog(KYMolController(fake, reporter=lambda message: None))
+        self.addCleanup(dialog.close)
+        dialog.chain_visual_timer.stop()
+        dialog.show()
+        self.app.processEvents()
+        dialog.search_edit.setText("099_very_long")
+        name = dialog._search_matches[0]
+        self.assertEqual(fake.objects[-1], name)
+        item = next(item for item in dialog.object_list.object_items() if item.text(0) == name)
+        self.assertTrue(dialog.object_list.viewport().rect().intersects(dialog.object_list.visualItemRect(item)))
+        self.assertEqual(name, item.toolTip(0))
+        with patch.object(fake, "iterate", side_effect=AssertionError("Search must not query atoms")):
+            dialog.search_edit.setText("result_")
+            dialog._step_search(99)
+            self.assertEqual("100 / 100", dialog.search_count.text())
+        dialog.refresh_objects(keep_selection=True)
+        self.assertEqual("100 / 100", dialog.search_count.text())
+        self.assertEqual(100, dialog.object_list.count())
+
+    def test_splitter_changes_list_height_and_keeps_tools_accessible(self):
+        dialog = KYMolDialog(KYMolController(FakeCmd(), reporter=lambda message: None))
+        self.addCleanup(dialog.close)
+        dialog.resize(820, 760)
+        dialog.show()
+        self.app.processEvents()
+        before = dialog.object_list.height()
+        sizes = dialog.content_splitter.sizes()
+        dialog.content_splitter.setSizes([sizes[0] + 90, sizes[1] - 90])
+        self.app.processEvents()
+        self.assertGreater(dialog.object_list.height(), before + 50)
+        self.assertTrue(dialog.content_splitter.handle(1).isVisible())
+        self.assertGreater(dialog.tools_scroll.height(), 40)
+
+    def test_model_search_expands_groups_and_preserves_selection_active_and_visibility(self):
+        fake = FakeCmd()
+        fake.groups = {"nested_results": ["model_2", "model_3"]}
+        fake.enabled = {"model_1"}
+        dialog = KYMolDialog(KYMolController(fake, reporter=lambda message: None))
+        self.addCleanup(dialog.close)
+        dialog.show()
+        items = {item.text(0): item for item in dialog.object_list.object_items()}
+        dialog.object_list.select_exclusive(items["model_1"])
+        dialog.object_list.topLevelItem(0).setExpanded(False)
+        expected = (list(dialog.controller.state.selected), dialog.controller.state.active, set(fake.enabled))
+        dialog.search_edit.setText("MODEL_")
+        self.app.processEvents()
+        self.assertEqual("1 / 3", dialog.search_count.text())
+        self.assertTrue(dialog.object_list.topLevelItem(0).isExpanded())
+        self.assertIs(dialog.object_list.currentItem(), items["model_1"])
+        dialog.search_next_button.click()
+        self.assertEqual("2 / 3", dialog.search_count.text())
+        dialog.search_previous_button.click()
+        self.assertEqual("1 / 3", dialog.search_count.text())
+        dialog.search_previous_button.click()
+        self.assertEqual("3 / 3", dialog.search_count.text())
+        self.assertEqual(expected, (dialog.controller.state.selected, dialog.controller.state.active, fake.enabled))
+        dialog.search_edit.setText("missing")
+        self.assertEqual("0 / 0", dialog.search_count.text())
+        self.assertFalse(dialog.search_next_button.isEnabled())
+        self.assertTrue(all(not item.isHidden() for item in dialog.object_list.object_items()))
+        dialog.search_edit.clear()
+        self.assertEqual(expected, (dialog.controller.state.selected, dialog.controller.state.active, fake.enabled))
+
+    def test_many_long_chain_labels_keep_row_height_and_are_reachable(self):
+        fake = FakeCmd()
+        fake.chains["model_1"] = ["CHAIN_{:02d}_LONG_LABEL".format(index) for index in range(40)]
+        dialog = KYMolDialog(KYMolController(fake, reporter=lambda message: None))
+        self.addCleanup(dialog.close)
+        dialog.show()
+        self.app.processEvents()
+        heights = [dialog.object_list.visualItemRect(item).height() for item in dialog.object_list.object_items()]
+        self.assertEqual(1, len(set(heights)))
+        strip = dialog.object_list.itemWidget(dialog.object_list.item(0), 1)
+        self.assertGreater(strip.scroll_area.horizontalScrollBar().maximum(), 0)
+        button = dialog._chain_buttons[("model_1", fake.chains["model_1"][-1])]
+        button.setFocus()
+        self.app.processEvents()
+        self.assertGreater(strip.scroll_area.horizontalScrollBar().value(), 0)
+        self.assertTrue(strip.scroll_area.viewport().rect().intersects(button.rect().translated(button.mapTo(strip.scroll_area.viewport(), QtCore.QPoint()))))
+        button.click()
+        self.assertEqual([fake.chains["model_1"][-1]], dialog.selected_chains["model_1"])
+        dialog._set_mode("object")
+        self.app.processEvents()
+        self.assertEqual(heights, [dialog.object_list.visualItemRect(item).height() for item in dialog.object_list.object_items()])
+
+    def test_chain_strip_retains_full_label_width_instead_of_eliding_every_button(self):
+        fake = FakeCmd()
+        fake.chains["model_1"] = ["LONG_CHAIN_{:02d}".format(index) for index in range(12)]
+        dialog = KYMolDialog(KYMolController(fake, reporter=lambda message: None))
+        self.addCleanup(dialog.close)
+        dialog.resize(540, 400)
+        dialog.show()
+        self.app.processEvents()
+        for chain in fake.chains["model_1"]:
+            button = dialog._chain_buttons[("model_1", chain)]
+            required_width = button.fontMetrics().horizontalAdvance(chain) + 10
+            if not button.icon().isNull():
+                required_width += button.iconSize().width() + 4
+            self.assertGreaterEqual(button.width(), required_width)
+        strip = dialog.object_list.itemWidget(dialog.object_list.item(0), 1)
+        self.assertGreater(strip.content.width(), strip.scroll_area.viewport().width())
+        self.assertTrue(strip.next_button.isEnabled())
+
+    def test_pending_long_chain_labels_survive_widget_polish_and_mode_rebuild(self):
+        fake = FakeCmd()
+        fake.groups = {"first_group": ["model_1", "model_2"]}
+        fake.chains["model_3"] = ["LONG_CHAIN_{:02d}".format(index) for index in range(12)]
+        dialog = KYMolDialog(KYMolController(fake, reporter=lambda message: None))
+        self.addCleanup(dialog.close)
+        dialog.chain_visual_timer.stop()
+        dialog.show()
+        for rebuild in (False, True):
+            if rebuild:
+                dialog._set_mode("object")
+                dialog._set_mode("chain")
+            self.app.processEvents()
+            for chain in fake.chains["model_3"]:
+                button = dialog._chain_buttons[("model_3", chain)]
+                self.assertFalse(button.property("chainVisualKnown"))
+                button.style().unpolish(button)
+                button.style().polish(button)
+                self.app.processEvents()
+                self.assertGreaterEqual(button.width(), button.fontMetrics().horizontalAdvance(chain) + 28)
+
     def test_last_clicked_selected_object_is_the_gold_active_target(self):
         dialog = KYMolDialog(KYMolController(FakeCmd(), reporter=lambda message: None))
         dialog.show()
@@ -207,7 +386,9 @@ class KYMolDialogTests(unittest.TestCase):
         self.assertNotEqual(first.background(0).color().name(), GOLD)
         second_rect = dialog.object_list.visualItemRect(second)
         rendered = dialog.object_list.viewport().grab().toImage()
-        rendered_gold = rendered.pixelColor(second_rect.left() + 4, second_rect.center().y())
+        # Sample empty cell background, not the first glyph's antialiased edge.
+        sample_x = dialog.object_list.columnWidth(0) - 20
+        rendered_gold = rendered.pixelColor(sample_x, second_rect.center().y())
         expected_gold = QtGui.QColor(GOLD)
         color_distance = sum(
             abs(actual - expected)
@@ -463,6 +644,9 @@ class KYMolDialogTests(unittest.TestCase):
         dialog.object_list.setFocus()
         self.app.processEvents()
 
+        self.assertEqual("chain", dialog.mode)
+        self.assertFalse(dialog.object_list.isColumnHidden(1))
+        dialog.chain_mode_toggle.setChecked(False)
         self.assertEqual("object", dialog.mode)
         self.assertTrue(dialog.object_list.isColumnHidden(1))
 
@@ -482,7 +666,7 @@ class KYMolDialogTests(unittest.TestCase):
         self.assertIsNotNone(chain_widget)
         self.assertEqual(
             ["A", "B"],
-            [button.text() for button in chain_widget.findChildren(QtWidgets.QToolButton)],
+            [button.text() for button in chain_widget.findChildren(QtWidgets.QToolButton) if button.isCheckable()],
         )
         dialog.close()
 
@@ -529,6 +713,60 @@ class KYMolDialogTests(unittest.TestCase):
         self.assertTrue(original_button.icon().isNull())
         dialog.close()
 
+    def test_chain_visual_polling_refreshes_only_one_object_per_tick(self):
+        fake_cmd = FakeCmd()
+        scanned_objects = []
+        original_iterate = fake_cmd.iterate
+
+        def recording_iterate(selection, expression, space):
+            scanned_objects.append(
+                tuple(
+                    name
+                    for name in fake_cmd.objects
+                    if 'model "{}"'.format(name) in selection
+                )
+            )
+            original_iterate(selection, expression, space)
+
+        fake_cmd.iterate = recording_iterate
+        dialog = KYMolDialog(KYMolController(fake_cmd, reporter=lambda message: None))
+        dialog.show()
+        dialog.chain_visual_timer.stop()
+        dialog._set_mode("chain")
+        self.app.processEvents()
+
+        self.assertTrue(scanned_objects)
+        self.assertTrue(all(len(names) == 1 for names in scanned_objects))
+
+        scanned_objects.clear()
+        dialog._refresh_chain_visuals()
+        dialog._refresh_chain_visuals()
+
+        self.assertEqual([("model_1",), ("model_2",)], scanned_objects)
+        dialog.close()
+
+    def test_chain_visual_polling_pauses_while_pymol_has_focus(self):
+        fake_cmd = FakeCmd()
+        dialog = KYMolDialog(KYMolController(fake_cmd, reporter=lambda message: None))
+        dialog.show()
+        dialog.chain_visual_timer.stop()
+        dialog._set_mode("chain")
+        self.app.processEvents()
+        iterate_calls = 0
+        original_iterate = fake_cmd.iterate
+
+        def counting_iterate(selection, expression, space):
+            nonlocal iterate_calls
+            iterate_calls += 1
+            original_iterate(selection, expression, space)
+
+        fake_cmd.iterate = counting_iterate
+        with patch.object(dialog, "isActiveWindow", return_value=False):
+            dialog._refresh_chain_visuals()
+
+        self.assertEqual(0, iterate_calls)
+        dialog.close()
+
     def test_hotbox_right_and_left_keys_switch_modes(self):
         dialog = KYMolDialog(KYMolController(FakeCmd(), reporter=lambda message: None))
         dialog.show()
@@ -553,7 +791,7 @@ class KYMolDialogTests(unittest.TestCase):
         self.app.processEvents()
         first = dialog.object_list.item(0)
         chain_widget = dialog.object_list.itemWidget(first, 1)
-        buttons = chain_widget.findChildren(QtWidgets.QToolButton)
+        buttons = [button for button in chain_widget.findChildren(QtWidgets.QToolButton) if button.isCheckable()]
 
         QtTest.QTest.mouseClick(buttons[0], QtCore.Qt.LeftButton)
         QtTest.QTest.mouseClick(buttons[1], QtCore.Qt.LeftButton)

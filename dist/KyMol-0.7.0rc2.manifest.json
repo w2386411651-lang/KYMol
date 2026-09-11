@@ -1,0 +1,48 @@
+{
+  "version": "0.7.0rc2",
+  "package": "KyMol-0.7.0rc2.zip",
+  "bytes": 40066,
+  "sha256": "320bed662a369abf463ed005c8f323bf7abe44ceb24b4310430ee017c5095d9e",
+  "files": [
+    {
+      "path": "KYMol/__init__.py",
+      "bytes": 7518,
+      "sha256": "92a3f2f1bca52f5e3e661d13556202d86997a9c00df9033b9c988afa64f9aed3"
+    },
+    {
+      "path": "KYMol/core.py",
+      "bytes": 36341,
+      "sha256": "367e0bb5808b1f4982064aa61d693fd975a2e51ef5837206c184ffa859055e3a"
+    },
+    {
+      "path": "KYMol/ui.py",
+      "bytes": 60518,
+      "sha256": "d83d41c35dbe62806c372ff89981a3786cfc24ecd8179562734097e433aa4a35"
+    },
+    {
+      "path": "KYMol/provenance.py",
+      "bytes": 14935,
+      "sha256": "1af2ac5ad36e75565398eaecf454e2d8fd5224fe3a5eb7e7bab4b2c5c511c45d"
+    },
+    {
+      "path": "KYMol/LICENSE",
+      "bytes": 1065,
+      "sha256": "7580047d4389e3c6886333a3bf39b9c67d6dcb2ad36ef02843f40e2605f19df3"
+    },
+    {
+      "path": "KYMol/README.md",
+      "bytes": 11287,
+      "sha256": "933249eb13fa3a5800b7c5410f51dcb5930341969bf160bb1d2aff6cab5588fc"
+    },
+    {
+      "path": "KYMol/INSTALLATION.zh-CN.md",
+      "bytes": 7634,
+      "sha256": "c5f5a92d9aefc8dbd02214f67c5cee3492253df671f472bf66d9f277cab12bcf"
+    },
+    {
+      "path": "KYMol/VERIFICATION.md",
+      "bytes": 3466,
+      "sha256": "ba637282a573f99a2ad3521c4cb9fb91f92efa9ad741e8021e38833ffbc02afb"
+    }
+  ]
+}

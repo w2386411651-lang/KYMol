@@ -140,7 +140,7 @@ class FakeCmd:
 
     def count_atoms(self, selection):
         # No current structural selection in this fixture.
-        return self.selection_atoms if "sele" in selection else 12
+        return self.selection_atoms if "sele" in selection else 20
 
     def iterate(self, selection, expression, space):
         for (object_name, chain), rows in self.atom_visuals.items():
@@ -322,9 +322,9 @@ class KYMolControllerTests(unittest.TestCase):
         calls = [call for call in self.cmd.calls if call[0] == "color"]
         self.assertEqual([26, 5, 154], [call[1] for call in calls])
         self.assertEqual(3, len(calls))
-        self.assertIn("chain A", calls[0][2])
-        self.assertIn("model ref", calls[0][2])
-        self.assertIn("model pose1", calls[0][2])
+        self.assertIn('chain "A"', calls[0][2])
+        self.assertIn('model "ref"', calls[0][2])
+        self.assertIn('model "pose1"', calls[0][2])
 
     def test_chain_coloring_is_undoable(self):
         self.controller.set_selection(["ref", "pose1"], active="ref")
@@ -339,14 +339,89 @@ class KYMolControllerTests(unittest.TestCase):
         self.controller.set_selection(["ref"], active="ref")
         self.cmd.selection_atoms = 4
         self.controller.export_active("x.cif", "cif")
-        self.assertEqual(("save", "x.cif", "(ref and sele)", "cif"), self.cmd.calls[-1])
+        self.assertEqual(("save", "x.cif", '(model "ref" and ?sele)', "cif"), self.cmd.calls[-1])
         self.controller.export_active("x.pdb", "pdb", whole_chain=True, chain="A")
-        self.assertEqual(("save", "x.pdb", "(ref and chain A)", "pdb"), self.cmd.calls[-1])
+        self.assertEqual(("save", "x.pdb", '(model "ref" and chain "A")', "pdb"), self.cmd.calls[-1])
 
     def test_alignment_requires_multiple_objects(self):
         self.controller.set_selection(["ref"], active="ref")
         with self.assertRaises(KYMolError):
             self.controller.align_selected()
+
+    def test_auto_alignment_rejects_missing_requested_target_chain(self):
+        self.controller.set_selection(["ref", "pose1"], active="ref")
+        with self.assertRaisesRegex(KYMolError, "No protein chain pair"):
+            self.controller.align_selected(chain="Z")
+        self.assertFalse([call for call in self.cmd.calls if call[0] == "align"])
+
+    def test_alignment_preflights_all_mobiles_before_moving_any(self):
+        self.cmd.chains["pose2"] = ["Z"]
+        self.controller.set_selection(["ref", "pose1", "pose2"], active="ref")
+        with self.assertRaises(KYMolError):
+            self.controller.align_selected(scope="common_chain")
+        self.assertEqual(0, self.cmd.transforms["pose1"])
+
+    def test_cealign_rejects_short_selection_before_running_engine(self):
+        self.controller.set_selection(["ref", "pose1"], active="ref")
+        self.cmd.count_atoms = lambda selection: 12
+        with self.assertRaisesRegex(KYMolError, "16 protein CA"):
+            self.controller.align_selected(method="cealign")
+        self.assertFalse([call for call in self.cmd.calls if call[0] == "cealign"])
+
+    def test_alignment_rejects_stale_mobile_selection(self):
+        self.controller.set_selection(["ref", "pose1"], active="ref")
+        self.cmd.objects.remove("pose1")
+        with self.assertRaisesRegex(KYMolError, "no longer exists"):
+            self.controller.align_selected()
+
+    def test_common_chain_alignment_supports_blank_chain_ids(self):
+        self.cmd.chains["pose1"] = [""]
+        self.cmd.chains["ref"] = [""]
+        self.controller.set_selection(["ref", "pose1"], active="ref")
+        self.controller.align_selected(scope="common_chain")
+        call = [call for call in self.cmd.calls if call[0] == "align"][-1]
+        self.assertIn('chain ""', call[1])
+
+    def test_invalid_active_object_does_not_pollute_selection(self):
+        self.controller.set_selection(["ref"], active="ref")
+        with self.assertRaises(KYMolError):
+            self.controller.set_active("missing")
+        self.assertEqual(["ref"], self.controller.state.selected)
+        self.assertEqual("ref", self.controller.state.active)
+
+    def test_chain_copy_rejects_missing_chain_before_partial_copy(self):
+        with self.assertRaisesRegex(KYMolError, "no longer exists"):
+            self.controller.copy_chains({"ref": ["A", "missing"]})
+        self.assertFalse([call for call in self.cmd.calls if call[0] == "create"])
+
+    def test_auto_chain_matching_reads_each_sequence_once_per_batch(self):
+        self.controller.set_selection(["ref", "pose1", "pose2"], active="ref")
+        self.controller.align_selected()
+        reads = [call[1] for call in self.cmd.calls if call[0] == "get_fastastr"]
+        self.assertEqual(len(reads), len(set(reads)))
+
+    def test_alignment_report_does_not_call_heuristic_ratio_identity(self):
+        self.controller.set_selection(["ref", "pose1"], active="ref")
+        self.controller.align_selected()
+        self.assertFalse(any("identity" in message for message in self.messages))
+
+    def test_automatic_chain_ties_are_reported_without_inventing_mapping(self):
+        self.cmd.sequences[("ref", "B")] = self.cmd.sequences[("ref", "A")]
+        self.controller.set_selection(["ref", "pose2"], active="ref")
+        self.controller.align_selected()
+        self.assertTrue(any("Ambiguous automatic chain match: 2 pairs" in message
+                            for message in self.messages))
+
+    def test_long_low_alphabet_sequences_keep_matching_with_autojunk_disabled(self):
+        # A one-position shift with a different leading residue makes default
+        # difflib autojunk discard all popular residue anchors at length >= 200.
+        sequence = "ACDEFGHIKLMNPQRSTVWY" * 20
+        self.cmd.sequences[("ref", "A")] = sequence
+        self.cmd.sequences[("ref", "B")] = "W" * len(sequence)
+        self.cmd.sequences[("pose2", "A")] = "Y" + sequence[:-1]
+        pair = self.controller._best_sequence_chain_pair("pose2", "ref")
+        self.assertEqual(("A", "A"), pair[:2])
+        self.assertGreater(pair[2], 0.99)
 
     def test_delete_selected_removes_objects_and_clears_panel_state(self):
         self.controller.set_selection(["pose1", "pose2"], active="pose2")

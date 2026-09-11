@@ -2,6 +2,29 @@
 
 All notable KyMol releases are listed here.
 
+## 0.7.0rc2 — In-session upgrade repair (2026-09-11)
+
+- Fixed rc1 initialization failure when PyMOL reloads the package while an older controller/UI remains cached (`KYMolController` missing `sources`). Refresh the private modules together and recreate the controller with the current interface.
+- Retire same-package old dialogs, timers, shortcuts and source observers; recover selection, active model, window geometry and controller history, including the dialog reference lost by a failed rc1 install.
+- Reuse the existing same-package menu callback and keep one current source observer on repeated installs. Molecular objects and source metadata remain in PyMOL.
+- Added actual in-session installer regression using the frozen 0.6.2 package, delivered rc1 and synthetic structures. The earlier rc1 verification covered cold startup and missed this upgrade path.
+
+## 0.7.0rc1 — Review panel update (2026-09-11)
+
+- Added a draggable model/tools divider, independently scrolling tools and a compact usable window.
+- Added case-insensitive model search with previous/next navigation, group expansion and location outlines, preserving active target, selection and object visibility.
+- Made chain tools visible by default and kept model rows stable with accessible horizontal chain strips.
+- Recorded source-file provenance on standard loads and preserved it through rename, group, chain copy/cut and PSE handoff; exports use an explained writable directory and protect recorded source files.
+- Fixed silent whole-object alignment fallback, missing `sele` export, unsafe literal chain selectors, invalid batch preflight and initial dialog selection loss. Preserved the existing chain-ranking heuristic with explicit tie reporting and request-scoped caching.
+- Added native PyMOL, Windows Qt and export regressions, verified with synthetic data.
+
+## 0.6.2
+
+- Replaced the once-per-second all-object atom scan with round-robin, one-object-at-a-time chain-state refreshes.
+- Paused chain-state polling completely whenever the KyMol panel is not the active window, eliminating background polling while the user manipulates the PyMOL viewport.
+- Reduced the median refresh cost in a real PyMOL 3.1.8 session with ten AlphaFold 3 CIF models (94,370 atoms) from 107.3 ms for one global scan to 12.0 ms per incremental tick; an inactive-panel tick takes approximately 0.002 ms.
+- Added regression tests for incremental polling and inactive-window suspension; the suite now contains 50 tests.
+
 ## 0.6.1
 
 - Kept the bottom status output available for errors and operation feedback while fixing it to a stable, scrollable height.
